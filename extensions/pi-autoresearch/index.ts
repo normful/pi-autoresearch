@@ -771,7 +771,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const state = runtime.state;
 
     if (state.results.length === 0) {
-      ctx.ui.setWidget("autoresearch", undefined);
+      if (!runtime.runningExperiment) {
+        ctx.ui.setWidget("autoresearch", undefined);
+        return;
+      }
+
+      ctx.ui.setWidget("autoresearch", (_tui, theme) => {
+        const parts = [
+          theme.fg("accent", "🔬"),
+          theme.fg("warning", " running…"),
+        ];
+
+        if (state.name) {
+          parts.push(theme.fg("dim", ` │ ${state.name}`));
+        }
+
+        parts.push(theme.fg("dim", ` │ ${runtime.runningExperiment.command}`));
+        parts.push(theme.fg("dim", "  (waiting for first logged result)"));
+
+        return new Text(parts.join(""), 0, 0);
+      });
       return;
     }
 
@@ -1125,6 +1144,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
+      updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
       onUpdate?.({
@@ -1143,6 +1163,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         });
       } finally {
         runtime.runningExperiment = null;
+        updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
       }
 
