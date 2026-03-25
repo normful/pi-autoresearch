@@ -9,6 +9,8 @@
 
 *Try an idea, measure it, keep what works, discard what doesn't, repeat forever.*
 
+An extension for **[pi](https://pi.dev/)** — an AI coding agent that runs in your terminal. pi-autoresearch gives pi the tools and workflow to run autonomous optimization loops: try an idea, benchmark it, keep improvements, revert regressions, repeat.
+
 Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). Works for any optimization target: test speed, bundle size, LLM training, build times, Lighthouse scores.
 
 ---
@@ -226,6 +228,23 @@ pnpm typecheck
 - Checks have a separate timeout (default 300s, configurable via `checks_timeout_seconds` in `run_experiment`).
 
 ---
+
+## Prerequisites
+
+1. **Install pi** — follow the instructions at [pi.dev](https://pi.dev/)
+2. **An API key** for your preferred LLM provider (configured in pi)
+
+## Controlling costs
+
+Autoresearch loops run autonomously and can burn through tokens. Two ways to cap spend:
+
+- **API key limits** — most providers let you set per-key or monthly budgets. Check your provider's dashboard.
+- **`maxIterations`** — cap experiments per session in `autoresearch.config.json`:
+   ```json
+   {
+     "maxIterations": 30
+   }
+   ```
 
 ## License
 
