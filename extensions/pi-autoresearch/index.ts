@@ -18,9 +18,19 @@ import type {
   ExtensionContext,
   Theme,
 } from "@mariozechner/pi-coding-agent";
-import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@mariozechner/pi-coding-agent";
+import {
+  truncateTail,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+} from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { Text, truncateToWidth, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
+import {
+  Text,
+  truncateToWidth,
+  matchesKey,
+  visibleWidth,
+} from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -108,7 +118,6 @@ interface RunDetails {
   /** Name of the primary metric (for display) */
   metricName: string;
   metricUnit: string;
-
 }
 
 interface LogDetails {
@@ -145,13 +154,13 @@ const RunParams = Type.Object({
   timeout_seconds: Type.Optional(
     Type.Number({
       description: "Kill after this many seconds (default: 600)",
-    })
+    }),
   ),
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
         "Kill autoresearch.checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
-    })
+    }),
   ),
 });
 
@@ -168,13 +177,13 @@ const InitParams = Type.Object({
     Type.String({
       description:
         'Unit for the primary metric. Use "µs", "ms", "s", "kb", "mb", or "" for unitless. Affects number formatting. Default: ""',
-    })
+    }),
   ),
   direction: Type.Optional(
     Type.String({
       description:
         'Whether "lower" or "higher" is better for the primary metric. Default: "lower".',
-    })
+    }),
   ),
 });
 
@@ -192,19 +201,19 @@ const LogParams = Type.Object({
     Type.Record(Type.String(), Type.Number(), {
       description:
         'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
-    })
+    }),
   ),
   force: Type.Optional(
     Type.Boolean({
       description:
         "Set to true to allow adding a new secondary metric that wasn't tracked before. Only use for metrics that have proven very valuable to watch.",
-    })
+    }),
   ),
   asi: Type.Optional(
     Type.Record(Type.String(), Type.Unknown(), {
       description:
-        'Actionable Side Information — structured diagnostics for this run. Free-form key/value pairs. Parsed ASI from run_experiment output is merged automatically; use this to add or override fields.',
-    })
+        "Actionable Side Information — structured diagnostics for this run. Free-form key/value pairs. Parsed ASI from run_experiment output is merged automatically; use this to add or override fields.",
+    }),
   ),
 });
 
@@ -232,7 +241,10 @@ const DENIED_METRIC_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
 function parseMetricLines(output: string): Map<string, number> {
   const metrics = new Map<string, number>();
-  const regex = new RegExp(`^${METRIC_LINE_PREFIX}\\s+([\\w.µ]+)=(\\S+)\\s*$`, "gm");
+  const regex = new RegExp(
+    `^${METRIC_LINE_PREFIX}\\s+([\\w.µ]+)=(\\S+)\\s*$`,
+    "gm",
+  );
   let match;
   while ((match = regex.exec(output)) !== null) {
     const name = match[1];
@@ -337,13 +349,15 @@ function isAutoresearchShCommand(command: string): boolean {
   //   bash [-flags] autoresearch.sh
   //   bash [-flags] ./autoresearch.sh
   //   bash [-flags] /path/to/autoresearch.sh
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\.\/|\/[\w/.-]*\/)?autoresearch\.sh(?:\s|$)/.test(cmd);
+  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\.\/|\/[\w/.-]*\/)?autoresearch\.sh(?:\s|$)/.test(
+    cmd,
+  );
 }
 
 function isBetter(
   current: number,
   best: number,
-  direction: "lower" | "higher"
+  direction: "lower" | "higher",
 ): boolean {
   return direction === "lower" ? current < best : current > best;
 }
@@ -360,13 +374,21 @@ function estimateTokensPerIteration(history: number[]): number {
   return Math.max(mean, median);
 }
 
-function hasRoomForNextIteration(history: number[], currentTokens: number, contextWindow: number): boolean {
+function hasRoomForNextIteration(
+  history: number[],
+  currentTokens: number,
+  contextWindow: number,
+): boolean {
   if (history.length < 1) return true;
-  const projectedTokens = currentTokens + estimateTokensPerIteration(history) * CONTEXT_SAFETY_MARGIN;
+  const projectedTokens =
+    currentTokens + estimateTokensPerIteration(history) * CONTEXT_SAFETY_MARGIN;
   return projectedTokens <= contextWindow;
 }
 
-function recordIterationTokens(runtime: AutoresearchRuntime, currentTokens: number | null): void {
+function recordIterationTokens(
+  runtime: AutoresearchRuntime,
+  currentTokens: number | null,
+): void {
   if (runtime.iterationStartTokens == null || currentTokens == null) return;
   const tokensConsumed = currentTokens - runtime.iterationStartTokens;
   if (tokensConsumed <= 0) return;
@@ -375,20 +397,32 @@ function recordIterationTokens(runtime: AutoresearchRuntime, currentTokens: numb
 
 function lastIterationTokens(runtime: AutoresearchRuntime): number | null {
   if (runtime.iterationTokenHistory.length === 0) return null;
-  return runtime.iterationTokenHistory[runtime.iterationTokenHistory.length - 1];
+  return runtime.iterationTokenHistory[
+    runtime.iterationTokenHistory.length - 1
+  ];
 }
 
-function advanceIterationTracking(runtime: AutoresearchRuntime, ctx: ExtensionContext): void {
+function advanceIterationTracking(
+  runtime: AutoresearchRuntime,
+  ctx: ExtensionContext,
+): void {
   const usage = ctx.getContextUsage();
   if (usage?.tokens == null) return;
   recordIterationTokens(runtime, usage.tokens);
   runtime.iterationStartTokens = usage.tokens;
 }
 
-function isContextExhausted(runtime: AutoresearchRuntime, ctx: ExtensionContext): boolean {
+function isContextExhausted(
+  runtime: AutoresearchRuntime,
+  ctx: ExtensionContext,
+): boolean {
   const usage = ctx.getContextUsage();
   if (usage?.tokens == null) return false;
-  return !hasRoomForNextIteration(runtime.iterationTokenHistory, usage.tokens, usage.contextWindow);
+  return !hasRoomForNextIteration(
+    runtime.iterationTokenHistory,
+    usage.tokens,
+    usage.contextWindow,
+  );
 }
 
 /** Compute the median of a numeric array (returns 0 for empty arrays) */
@@ -414,7 +448,7 @@ function sortedMedian(values: number[]): number {
 function computeConfidence(
   results: ExperimentResult[],
   segment: number,
-  direction: "lower" | "higher"
+  direction: "lower" | "higher",
 ): number | null {
   const cur = currentResults(results, segment).filter((r) => r.metric > 0);
   if (cur.length < 3) return null;
@@ -445,7 +479,10 @@ function computeConfidence(
 }
 
 /** Get results in the current segment only */
-function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
+function currentResults(
+  results: ExperimentResult[],
+  segment: number,
+): ExperimentResult[] {
   return results.filter((r) => r.segment === segment);
 }
 
@@ -468,7 +505,7 @@ function readConfig(cwd: string): AutoresearchConfig {
 /** Read maxExperiments from autoresearch.config.json (if it exists) */
 function readMaxExperiments(cwd: string): number | null {
   const config = readConfig(cwd);
-  return (typeof config.maxIterations === "number" && config.maxIterations > 0)
+  return typeof config.maxIterations === "number" && config.maxIterations > 0
     ? Math.floor(config.maxIterations)
     : null;
 }
@@ -505,12 +542,18 @@ function validateWorkDir(ctxCwd: string): string | null {
 }
 
 /** Baseline = first experiment in current segment */
-function findBaselineMetric(results: ExperimentResult[], segment: number): number | null {
+function findBaselineMetric(
+  results: ExperimentResult[],
+  segment: number,
+): number | null {
   const cur = currentResults(results, segment);
   return cur.length > 0 ? cur[0].metric : null;
 }
 
-function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
+function findBaselineRunNumber(
+  results: ExperimentResult[],
+  segment: number,
+): number | null {
   const index = results.findIndex((result) => result.segment === segment);
   return index >= 0 ? index + 1 : null;
 }
@@ -523,12 +566,11 @@ function findBaselineRunNumber(results: ExperimentResult[], segment: number): nu
 function findBaselineSecondary(
   results: ExperimentResult[],
   segment: number,
-  knownMetrics?: MetricDef[]
+  knownMetrics?: MetricDef[],
 ): Record<string, number> {
   const cur = currentResults(results, segment);
-  const base: Record<string, number> = cur.length > 0
-    ? { ...(cur[0].metrics ?? {}) }
-    : {};
+  const base: Record<string, number> =
+    cur.length > 0 ? { ...(cur[0].metrics ?? {}) } : {};
 
   // Fill in any known metrics missing from baseline with their first occurrence
   if (knownMetrics) {
@@ -621,7 +663,7 @@ function renderDashboardLines(
   st: ExperimentState,
   width: number,
   th: Theme,
-  maxRows: number = 6
+  maxRows: number = 6,
 ): string[] {
   const lines: string[] = [];
 
@@ -637,8 +679,15 @@ function renderDashboardLines(
   const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
 
   const baseline = st.bestMetric;
-  const baselineRunNumber = findBaselineRunNumber(st.results, st.currentSegment);
-  const baselineSec = findBaselineSecondary(st.results, st.currentSegment, st.secondaryMetrics);
+  const baselineRunNumber = findBaselineRunNumber(
+    st.results,
+    st.currentSegment,
+  );
+  const baselineSec = findBaselineSecondary(
+    st.results,
+    st.currentSegment,
+    st.secondaryMetrics,
+  );
 
   // Find best kept primary metric and its run number (current segment only)
   let bestPrimary: number | null = null;
@@ -648,7 +697,10 @@ function renderDashboardLines(
     const r = st.results[i];
     if (r.segment !== st.currentSegment) continue;
     if (r.status === "keep" && r.metric > 0) {
-      if (bestPrimary === null || isBetter(r.metric, bestPrimary, st.bestDirection)) {
+      if (
+        bestPrimary === null ||
+        isBetter(r.metric, bestPrimary, st.bestDirection)
+      ) {
         bestPrimary = r.metric;
         bestSecondary = r.metrics ?? {};
         bestRunNum = i + 1;
@@ -657,34 +709,44 @@ function renderDashboardLines(
   }
 
   // Runs summary
-  const confSuffix = st.confidence !== null
-    ? (() => {
-        const confStr = st.confidence!.toFixed(1);
-        const confColor: Parameters<typeof th.fg>[0] = st.confidence! >= 2.0 ? "success" : st.confidence! >= 1.0 ? "warning" : "error";
-        return `  ${th.fg(confColor, `(conf: ${confStr}×)`)}`;
-      })()
-    : "";
+  const confSuffix =
+    st.confidence !== null
+      ? (() => {
+          const confStr = st.confidence!.toFixed(1);
+          const confColor: Parameters<typeof th.fg>[0] =
+            st.confidence! >= 2.0
+              ? "success"
+              : st.confidence! >= 1.0
+                ? "warning"
+                : "error";
+          return `  ${th.fg(confColor, `(conf: ${confStr}×)`)}`;
+        })()
+      : "";
   lines.push(
     truncateToWidth(
       `  ${th.fg("muted", "Runs:")} ${th.fg("text", String(st.results.length))}` +
         `  ${th.fg("success", `${kept} kept`)}` +
         confSuffix +
-        (discarded > 0 ? `  ${th.fg("warning", `${discarded} discarded`)}` : "") +
+        (discarded > 0
+          ? `  ${th.fg("warning", `${discarded} discarded`)}`
+          : "") +
         (crashed > 0 ? `  ${th.fg("error", `${crashed} crashed`)}` : "") +
-        (checksFailed > 0 ? `  ${th.fg("error", `${checksFailed} checks failed`)}` : ""),
-      width
-    )
+        (checksFailed > 0
+          ? `  ${th.fg("error", `${checksFailed} checks failed`)}`
+          : ""),
+      width,
+    ),
   );
 
   // Baseline: first run's primary metric
-  const baselineSuffix = baselineRunNumber === null ? "" : ` #${baselineRunNumber}`;
+  const baselineSuffix =
+    baselineRunNumber === null ? "" : ` #${baselineRunNumber}`;
   lines.push(
     truncateToWidth(
       `  ${th.fg("muted", "Baseline:")} ${th.fg("muted", `★ ${st.metricName}: ${formatNum(baseline, st.metricUnit)}${baselineSuffix}`)}`,
-      width
-    )
+      width,
+    ),
   );
-
 
   // Progress: best primary metric with delta + run number
   if (bestPrimary !== null) {
@@ -693,7 +755,9 @@ function renderDashboardLines(
     if (baseline !== null && baseline !== 0 && bestPrimary !== baseline) {
       const pct = ((bestPrimary - baseline) / baseline) * 100;
       const sign = pct > 0 ? "+" : "";
-      const color = isBetter(bestPrimary, baseline, st.bestDirection) ? "success" : "error";
+      const color = isBetter(bestPrimary, baseline, st.bestDirection)
+        ? "success"
+        : "error";
       progressLine += th.fg(color, ` (${sign}${pct.toFixed(1)}%)`);
     }
 
@@ -729,7 +793,9 @@ function renderDashboardLines(
           const partVisW = visibleWidth(part);
           const sep = curLine ? "  " : "";
           if (curLine && curVisW + sep.length + partVisW > maxLineW) {
-            lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
+            lines.push(
+              truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width),
+            );
             curLine = part;
             curVisW = partVisW;
           } else {
@@ -738,7 +804,9 @@ function renderDashboardLines(
           }
         }
         if (curLine) {
-          lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
+          lines.push(
+            truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width),
+          );
         }
       }
     }
@@ -753,7 +821,7 @@ function renderDashboardLines(
 
   // Only show secondary metric columns that have at least one value in visible rows
   const secMetrics = st.secondaryMetrics.filter((sm) =>
-    visibleRows.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
+    visibleRows.some((r) => (r.metrics ?? {})[sm.name] !== undefined),
   );
 
   // Column definitions — guarantee 25% of width for description
@@ -765,7 +833,10 @@ function renderDashboardLines(
 
   // Drop secondary columns from the right until they fit
   let visibleSecMetrics = secMetrics;
-  while (visibleSecMetrics.length > 0 && visibleSecMetrics.length * secColWidth > availableForSec) {
+  while (
+    visibleSecMetrics.length > 0 &&
+    visibleSecMetrics.length * secColWidth > availableForSec
+  ) {
     visibleSecMetrics = visibleSecMetrics.slice(0, -1);
   }
 
@@ -781,7 +852,7 @@ function renderDashboardLines(
   for (const sm of visibleSecMetrics) {
     headerLine += th.fg(
       "muted",
-      sm.name.slice(0, secColWidth - 1).padEnd(secColWidth)
+      sm.name.slice(0, secColWidth - 1).padEnd(secColWidth),
     );
   }
 
@@ -791,10 +862,7 @@ function renderDashboardLines(
 
   lines.push(truncateToWidth(headerLine, width));
   lines.push(
-    truncateToWidth(
-      `  ${th.fg("borderMuted", "─".repeat(width - 4))}`,
-      width
-    )
+    truncateToWidth(`  ${th.fg("borderMuted", "─".repeat(width - 4))}`, width),
   );
 
   // Baseline values for delta display (current segment only)
@@ -802,7 +870,7 @@ function renderDashboardLines(
   const baselineSecondary = findBaselineSecondary(
     st.results,
     st.currentSegment,
-    st.secondaryMetrics
+    st.secondaryMetrics,
   );
 
   // Show max 6 recent runs, with a note about hidden earlier ones
@@ -810,15 +878,17 @@ function renderDashboardLines(
     lines.push(
       truncateToWidth(
         `  ${th.fg("dim", `… ${startIdx} earlier run${startIdx === 1 ? "" : "s"}`)}`,
-        width
-      )
+        width,
+      ),
     );
   }
 
   for (let i = startIdx; i < st.results.length; i++) {
     const r = st.results[i];
     const isOld = r.segment !== st.currentSegment;
-    const isBaseline = !isOld && i === st.results.findIndex((x) => x.segment === st.currentSegment);
+    const isBaseline =
+      !isOld &&
+      i === st.results.findIndex((x) => x.segment === st.currentSegment);
 
     const color = isOld
       ? "dim"
@@ -900,7 +970,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
   const runtimeStore = createRuntimeStore();
-  const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
+  const getSessionKey = (ctx: ExtensionContext) =>
+    ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
@@ -965,7 +1036,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     try {
       if (fs.existsSync(jsonlPath)) {
         let segment = 0;
-        const lines = fs.readFileSync(jsonlPath, "utf-8").trim().split("\n").filter(Boolean);
+        const lines = fs
+          .readFileSync(jsonlPath, "utf-8")
+          .trim()
+          .split("\n")
+          .filter(Boolean);
         for (const line of lines) {
           try {
             const entry = JSON.parse(line);
@@ -974,8 +1049,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (entry.type === "config") {
               if (entry.name) state.name = entry.name;
               if (entry.metricName) state.metricName = entry.metricName;
-              if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
-              if (entry.bestDirection) state.bestDirection = entry.bestDirection;
+              if (entry.metricUnit !== undefined)
+                state.metricUnit = entry.metricUnit;
+              if (entry.bestDirection)
+                state.bestDirection = entry.bestDirection;
               // Increment segment (first config = 0, second = 1, etc.)
               if (state.results.length > 0) {
                 segment++;
@@ -1011,7 +1088,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                 let unit = "";
                 if (name.endsWith("µs")) unit = "µs";
                 else if (name.endsWith("_ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+                else if (name.endsWith("_s") || name.endsWith("_sec"))
+                  unit = "s";
                 else if (name.endsWith("_kb")) unit = "kb";
                 else if (name.endsWith("_mb")) unit = "mb";
                 state.secondaryMetrics.push({ name, unit });
@@ -1023,8 +1101,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
         if (state.results.length > 0) {
           loadedFromJsonl = true;
-          state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
-          state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+          state.bestMetric = findBaselineMetric(
+            state.results,
+            state.currentSegment,
+          );
+          state.confidence = computeConfidence(
+            state.results,
+            state.currentSegment,
+            state.bestDirection,
+          );
         }
       }
     } catch {
@@ -1051,18 +1136,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (r.confidence === undefined) r.confidence = null;
           }
           if (state.confidence === undefined) {
-            state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+            state.confidence = computeConfidence(
+              state.results,
+              state.currentSegment,
+              state.bestDirection,
+            );
           }
         }
       }
     }
 
-
     // Read max experiments from config file
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+    runtime.autoresearchMode = fs.existsSync(
+      path.join(workDir, "autoresearch.jsonl"),
+    );
 
     updateWidget(ctx);
   };
@@ -1112,15 +1202,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (label.length > maxLabelLen) {
           label = label.slice(0, maxLabelLen - 1) + "…";
         }
-        const fillLen = Math.max(0, width - 3 - 1 - label.length - 1 - hintText.length);
+        const fillLen = Math.max(
+          0,
+          width - 3 - 1 - label.length - 1 - hintText.length,
+        );
         lines.push(
           truncateToWidth(
             theme.fg("borderMuted", "───") +
               theme.fg("accent", " " + label + " ") +
               theme.fg("borderMuted", "─".repeat(fillLen)) +
               theme.fg("dim", hintText),
-            width
-          )
+            width,
+          ),
         );
 
         lines.push(...renderDashboardLines(state, width, theme));
@@ -1133,9 +1226,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const cur = currentResults(state.results, state.currentSegment);
         const kept = cur.filter((r) => r.status === "keep").length;
         const crashed = cur.filter((r) => r.status === "crash").length;
-        const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
+        const checksFailed = cur.filter(
+          (r) => r.status === "checks_failed",
+        ).length;
         const baseline = state.bestMetric;
-        const baselineSec = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+        const baselineSec = findBaselineSecondary(
+          state.results,
+          state.currentSegment,
+          state.secondaryMetrics,
+        );
 
         // Find best kept primary metric, its secondary values, and run number
         let bestPrimary: number | null = null;
@@ -1145,7 +1244,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const r = state.results[i];
           if (r.segment !== state.currentSegment) continue;
           if (r.status === "keep" && r.metric > 0) {
-            if (bestPrimary === null || isBetter(r.metric, bestPrimary, state.bestDirection)) {
+            if (
+              bestPrimary === null ||
+              isBetter(r.metric, bestPrimary, state.bestDirection)
+            ) {
               bestPrimary = r.metric;
               bestSec = r.metrics ?? {};
               bestRunNum = i + 1;
@@ -1159,24 +1261,45 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           theme.fg("muted", ` ${state.results.length} runs`),
           theme.fg("success", ` ${kept} kept`),
           crashed > 0 ? theme.fg("error", ` ${crashed}💥`) : "",
-          checksFailed > 0 ? theme.fg("error", ` ${checksFailed}⚠`) : "",
+          checksFailed > 0 ? theme.fg("error", ` ${checksFailed}!`) : "",
           theme.fg("dim", " │ "),
-          theme.fg("warning", theme.bold(`★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`)),
+          theme.fg(
+            "warning",
+            theme.bold(
+              `★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`,
+            ),
+          ),
           bestRunNum > 0 ? theme.fg("dim", ` #${bestRunNum}`) : "",
         ];
 
         // Show delta % vs baseline for primary
-        if (baseline !== null && bestPrimary !== null && baseline !== 0 && bestPrimary !== baseline) {
+        if (
+          baseline !== null &&
+          bestPrimary !== null &&
+          baseline !== 0 &&
+          bestPrimary !== baseline
+        ) {
           const pct = ((bestPrimary - baseline) / baseline) * 100;
           const sign = pct > 0 ? "+" : "";
-          const deltaColor = isBetter(bestPrimary, baseline, state.bestDirection) ? "success" : "error";
+          const deltaColor = isBetter(
+            bestPrimary,
+            baseline,
+            state.bestDirection,
+          )
+            ? "success"
+            : "error";
           parts.push(theme.fg(deltaColor, ` (${sign}${pct.toFixed(1)}%)`));
         }
 
         // Show confidence score
         if (state.confidence !== null) {
           const confStr = state.confidence.toFixed(1);
-          const confColor: Parameters<typeof theme.fg>[0] = state.confidence >= 2.0 ? "success" : state.confidence >= 1.0 ? "warning" : "error";
+          const confColor: Parameters<typeof theme.fg>[0] =
+            state.confidence >= 2.0
+              ? "success"
+              : state.confidence >= 1.0
+                ? "warning"
+                : "error";
           parts.push(theme.fg("dim", " │ "));
           parts.push(theme.fg(confColor, `conf: ${confStr}×`));
         }
@@ -1189,7 +1312,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (val !== undefined) {
               parts.push(theme.fg("dim", "  "));
               // Color value and delta separately to avoid color bleed
-              parts.push(theme.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`));
+              parts.push(
+                theme.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`),
+              );
               if (bv !== undefined && bv !== 0 && val !== bv) {
                 const p = ((val - bv) / bv) * 100;
                 const s = p > 0 ? "+" : "";
@@ -1204,7 +1329,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           parts.push(theme.fg("dim", ` │ ${state.name}`));
         }
 
-        parts.push(theme.fg("dim", "  (ctrl+x expand • ctrl+shift+x fullscreen)"));
+        parts.push(
+          theme.fg("dim", "  (ctrl+x expand • ctrl+shift+x fullscreen)"),
+        );
 
         return new Text(parts.join(""), 0, 0);
       });
@@ -1247,7 +1374,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS) {
       ctx.ui.notify(
         `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
-        "info"
+        "info",
       );
       return;
     }
@@ -1258,9 +1385,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const ideasPath = path.join(workDir, "autoresearch.ideas.md");
     const hasIdeas = fs.existsSync(ideasPath);
 
-    let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
+    let resumeMsg =
+      "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
     if (hasIdeas) {
-      resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
+      resumeMsg +=
+        " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
     }
     resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
 
@@ -1379,10 +1508,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       } catch (e) {
         return {
-          content: [{
-            type: "text",
-            text: `⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
-          }],
+          content: [
+            {
+              type: "text",
+              text: `! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
           details: {},
         };
       }
@@ -1391,14 +1522,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
       updateWidget(ctx);
 
-      const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
-      const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
-      const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const reinitNote = isReinit
+        ? " (re-initialized — previous results archived, new baseline needed)"
+        : "";
+      const limitNote =
+        state.maxExperiments !== null
+          ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)`
+          : "";
+      const workDirNote =
+        workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
       return {
-        content: [{
-          type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
-        }],
+        content: [
+          {
+            type: "text",
+            text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          },
+        ],
         details: { state: cloneExperimentState(state) },
       };
     },
@@ -1422,15 +1561,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "run_experiment",
     label: "Run Experiment",
-    description:
-      `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
+    description: `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
     promptSnippet:
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
       "After run_experiment, always call log_experiment to record the result.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
-
     ],
     parameters: RunParams,
 
@@ -1450,10 +1587,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
-        const segCount = currentResults(state.results, state.currentSegment).length;
+        const segCount = currentResults(
+          state.results,
+          state.currentSegment,
+        ).length;
         if (segCount >= state.maxExperiments) {
           return {
-            content: [{ type: "text", text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.` }],
+            content: [
+              {
+                type: "text",
+                text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.`,
+              },
+            ],
             details: {},
           };
         }
@@ -1463,12 +1608,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Guard: if autoresearch.sh exists, only allow running it
       const autoresearchShPath = path.join(workDir, "autoresearch.sh");
-      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+      if (
+        fs.existsSync(autoresearchShPath) &&
+        !isAutoresearchShCommand(params.command)
+      ) {
         return {
-          content: [{
-            type: "text",
-            text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
-          }],
+          content: [
+            {
+              type: "text",
+              text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
+            },
+          ],
           details: {
             command: params.command,
             exitCode: null,
@@ -1490,12 +1640,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.autoresearchMode = false;
         ctx.abort();
         return {
-          content: [{ type: "text", text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved." }],
+          content: [
+            {
+              type: "text",
+              text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved.",
+            },
+          ],
           details: {},
         };
       }
 
-      runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
+      runtime.runningExperiment = {
+        startedAt: Date.now(),
+        command: params.command,
+      };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
@@ -1503,7 +1661,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
-      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
+      const {
+        exitCode,
+        killed: timedOut,
+        output,
+        tempFilePath: streamTempFile,
+        actualTotalBytes,
+      } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
@@ -1620,7 +1784,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             // and also queue killTree for spawn in case child.kill() isn't enough
             // to clean up the full process tree.
             child.kill();
-            child.once("spawn", () => { if (child.pid) killTree(child.pid); });
+            child.once("spawn", () => {
+              if (child.pid) killTree(child.pid);
+            });
           }
         };
         if (signal) {
@@ -1688,7 +1854,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           checksDuration = (Date.now() - ct0) / 1000;
           checksTimedOut = !!checksResult.killed;
           checksPass = checksResult.code === 0 && !checksResult.killed;
-          checksOutput = (checksResult.stdout + "\n" + checksResult.stderr).trim();
+          checksOutput = (
+            checksResult.stdout +
+            "\n" +
+            checksResult.stderr
+          ).trim();
         } catch (e) {
           checksDuration = (Date.now() - ct0) / 1000;
           checksPass = false;
@@ -1697,14 +1867,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Store checks result for log_experiment gate
-      runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
+      runtime.lastRunChecks =
+        checksPass !== null
+          ? { pass: checksPass, output: checksOutput, duration: checksDuration }
+          : null;
 
       const passed = benchmarkPassed && (checksPass === null || checksPass);
 
       // Reuse streaming temp file if it exists, otherwise create one for large output
       let fullOutputPath: string | undefined = streamTempFile;
       const totalLines = output.split("\n").length;
-      if (!fullOutputPath && (actualTotalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES)) {
+      if (
+        !fullOutputPath &&
+        (actualTotalBytes > EXPERIMENT_MAX_BYTES ||
+          totalLines > EXPERIMENT_MAX_LINES)
+      ) {
         fullOutputPath = getTempFile();
         fs.writeFileSync(fullOutputPath, output);
       }
@@ -1723,9 +1900,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Parse structured METRIC lines from output
       const parsedMetricMap = parseMetricLines(output);
-      const parsedMetrics = parsedMetricMap.size > 0
-        ? Object.fromEntries(parsedMetricMap)
-        : null;
+      const parsedMetrics =
+        parsedMetricMap.size > 0 ? Object.fromEntries(parsedMetricMap) : null;
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
 
       const details: RunDetails = {
@@ -1773,7 +1949,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Show parsed METRIC lines to the LLM
       if (parsedMetrics) {
-        const secondary = Object.entries(parsedMetrics).filter(([k]) => k !== state.metricName);
+        const secondary = Object.entries(parsedMetrics).filter(
+          ([k]) => k !== state.metricName,
+        );
 
         // Human-readable summary
         text += `\n📐 Parsed metrics:`;
@@ -1811,7 +1989,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text }],
-        details: { ...details, truncation: llmTruncation.truncated ? llmTruncation : undefined, fullOutputPath },
+        details: {
+          ...details,
+          truncation: llmTruncation.truncated ? llmTruncation : undefined,
+          fullOutputPath,
+        },
       };
     },
 
@@ -1829,11 +2011,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (isPartial) {
         // Streaming: show elapsed timer + tail of output
-        const d = result.details as { phase?: string; elapsed?: string; truncation?: any; fullOutputPath?: string } | undefined;
+        const d = result.details as
+          | {
+              phase?: string;
+              elapsed?: string;
+              truncation?: any;
+              fullOutputPath?: string;
+            }
+          | undefined;
         const elapsed = d?.elapsed ?? "";
-        const outputText = result.content[0]?.type === "text" ? result.content[0].text : "";
+        const outputText =
+          result.content[0]?.type === "text" ? result.content[0].text : "";
 
-        let text = theme.fg("warning", `⏳ Running${elapsed ? ` ${elapsed}` : ""}…`);
+        let text = theme.fg(
+          "warning",
+          `⏳ Running${elapsed ? ` ${elapsed}` : ""}…`,
+        );
 
         // Always show tail of streaming output (like bash tool shows preview lines)
         if (outputText) {
@@ -1848,7 +2041,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return new Text(text, 0, 0);
       }
 
-      const d = result.details as (RunDetails & { truncation?: any; fullOutputPath?: string }) | undefined;
+      const d = result.details as
+        | (RunDetails & { truncation?: any; fullOutputPath?: string })
+        | undefined;
       if (!d) {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
@@ -1874,21 +2069,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       };
 
       if (d.timedOut) {
-        let text = theme.fg("error", `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`);
+        let text = theme.fg(
+          "error",
+          `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`,
+        );
         text = appendOutput(text, d.tailOutput);
         return new Text(text, 0, 0);
       }
 
       // Helper: format parsed primary metric suffix (empty string if not available)
-      const parsedSuffix = d.parsedPrimary !== null
-        ? theme.fg("accent", `, ${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`)
-        : "";
+      const parsedSuffix =
+        d.parsedPrimary !== null
+          ? theme.fg(
+              "accent",
+              `, ${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
+            )
+          : "";
 
       if (d.checksTimedOut) {
         let text =
           theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
           parsedSuffix +
-          theme.fg("error", ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`);
+          theme.fg(
+            "error",
+            ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`,
+          );
         text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
       }
@@ -1897,13 +2102,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         let text =
           theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
           parsedSuffix +
-          theme.fg("error", ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`);
+          theme.fg(
+            "error",
+            ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`,
+          );
         text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
       }
 
       if (d.crashed) {
-        let text = theme.fg("error", `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`) + parsedSuffix;
+        let text =
+          theme.fg(
+            "error",
+            `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`,
+          ) + parsedSuffix;
         text = appendOutput(text, d.tailOutput);
         return new Text(text, 0, 0);
       }
@@ -1913,12 +2125,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Show wall-clock and parsed primary metric together
       const parts: string[] = [`wall: ${d.durationSeconds.toFixed(1)}s`];
       if (d.parsedPrimary !== null) {
-        parts.push(`${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`);
+        parts.push(
+          `${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
+        );
       }
       text += theme.fg("accent", parts.join(", "));
 
       if (d.checksPass === true) {
-        text += theme.fg("success", ` ✓ checks ${d.checksDuration.toFixed(1)}s`);
+        text += theme.fg(
+          "success",
+          ` ✓ checks ${d.checksDuration.toFixed(1)}s`,
+        );
       }
 
       if (d.truncation?.truncated && d.fullOutputPath) {
@@ -1929,9 +2146,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (expanded && d.truncation?.truncated && d.fullOutputPath) {
         if (d.truncation.truncatedBy === "lines") {
-          text += "\n" + theme.fg("warning", `[Truncated: showing ${d.truncation.outputLines} of ${d.truncation.totalLines} lines. Full output: ${d.fullOutputPath}]`);
+          text +=
+            "\n" +
+            theme.fg(
+              "warning",
+              `[Truncated: showing ${d.truncation.outputLines} of ${d.truncation.totalLines} lines. Full output: ${d.fullOutputPath}]`,
+            );
         } else {
-          text += "\n" + theme.fg("warning", `[Truncated: ${d.truncation.outputLines} lines shown (${formatSize(EXPERIMENT_MAX_BYTES)} limit). Full output: ${d.fullOutputPath}]`);
+          text +=
+            "\n" +
+            theme.fg(
+              "warning",
+              `[Truncated: ${d.truncation.outputLines} lines shown (${formatSize(EXPERIMENT_MAX_BYTES)} limit). Full output: ${d.fullOutputPath}]`,
+            );
         }
       }
 
@@ -1956,7 +2183,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
       "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
-      "Always include the asi parameter. At minimum: {\"hypothesis\": \"what you tried\"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.",
+      'Always include the asi parameter. At minimum: {"hypothesis": "what you tried"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.',
     ],
     parameters: LogParams,
 
@@ -1976,12 +2203,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const secondaryMetrics = params.metrics ?? {};
 
       // Gate: prevent "keep" when last run's checks failed
-      if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
+      if (
+        params.status === "keep" &&
+        runtime.lastRunChecks &&
+        !runtime.lastRunChecks.pass
+      ) {
         return {
-          content: [{
-            type: "text",
-            text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
-          }],
+          content: [
+            {
+              type: "text",
+              text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+            },
+          ],
           details: {},
         };
       }
@@ -1995,10 +2228,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const missing = [...knownNames].filter((n) => !providedNames.has(n));
         if (missing.length > 0) {
           return {
-            content: [{
-              type: "text",
-              text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
-            }],
+            content: [
+              {
+                type: "text",
+                text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+              },
+            ],
             details: {},
           };
         }
@@ -2007,19 +2242,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
         if (newMetrics.length > 0 && !params.force) {
           return {
-            content: [{
-              type: "text",
-              text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
-            }],
+            content: [
+              {
+                type: "text",
+                text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
+              },
+            ],
             details: {},
           };
         }
       }
 
       // ASI: agent-supplied free-form diagnostics
-      const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-        ? params.asi as ASI
-        : undefined;
+      const mergedASI =
+        params.asi && Object.keys(params.asi).length > 0
+          ? (params.asi as ASI)
+          : undefined;
 
       const iterationTokens = lastIterationTokens(runtime);
 
@@ -2053,14 +2291,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Baseline = first run in current segment
-      state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+      state.bestMetric = findBaselineMetric(
+        state.results,
+        state.currentSegment,
+      );
 
       // Compute confidence score (best improvement as multiple of noise floor)
-      state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+      state.confidence = computeConfidence(
+        state.results,
+        state.currentSegment,
+        state.bestDirection,
+      );
       experiment.confidence = state.confidence;
 
       // Build response text
-      const segmentCount = currentResults(state.results, state.currentSegment).length;
+      const segmentCount = currentResults(
+        state.results,
+        state.currentSegment,
+      ).length;
       let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
@@ -2075,7 +2323,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Show secondary metrics
       if (Object.keys(secondaryMetrics).length > 0) {
-        const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+        const baselines = findBaselineSecondary(
+          state.results,
+          state.currentSegment,
+          state.secondaryMetrics,
+        );
         const parts: string[] = [];
         for (const [name, value] of Object.entries(secondaryMetrics)) {
           const def = state.secondaryMetrics.find((m) => m.name === name);
@@ -2113,7 +2365,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else if (state.confidence >= 1.0) {
           text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
         } else {
-          text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+          text += `\n! Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
         }
       }
 
@@ -2138,21 +2390,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const addResult = await pi.exec("git", ["add", "-A"], execOpts);
           if (addResult.code !== 0) {
             const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+            throw new Error(
+              `git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`,
+            );
           }
 
-          const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
+          const diffResult = await pi.exec(
+            "git",
+            ["diff", "--cached", "--quiet"],
+            execOpts,
+          );
           if (diffResult.code === 0) {
             text += `\n📝 Git: nothing to commit (working tree clean)`;
           } else {
-            const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
+            const gitResult = await pi.exec(
+              "git",
+              ["commit", "-m", commitMsg],
+              execOpts,
+            );
             const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
             if (gitResult.code === 0) {
               const firstLine = gitOutput.split("\n")[0] || "";
               text += `\n📝 Git: committed — ${firstLine}`;
 
               try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
+                const shaResult = await pi.exec(
+                  "git",
+                  ["rev-parse", "--short=7", "HEAD"],
+                  { cwd: workDir, timeout: 5000 },
+                );
                 const newSha = (shaResult.stdout || "").trim();
                 if (newSha && newSha.length >= 7) {
                   experiment.commit = newSha;
@@ -2161,11 +2427,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                 // Keep the original commit hash if rev-parse fails
               }
             } else {
-              text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
+              text += `\n! Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
             }
           }
         } catch (e) {
-          text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+          text += `\n! Git commit error: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
@@ -2180,18 +2446,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!mergedASI) delete jsonlEntry.asi;
         fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
       } catch (e) {
-        text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+        text += `\n! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
       // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+          const protectedFiles = [
+            "autoresearch.jsonl",
+            "autoresearch.md",
+            "autoresearch.ideas.md",
+            "autoresearch.sh",
+            "autoresearch.checks.sh",
+          ];
+          const stageCmd = protectedFiles
+            .map(
+              (f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`,
+            )
+            .join("; ");
+          await pi.exec(
+            "bash",
+            ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`],
+            { cwd: workDir, timeout: 10000 },
+          );
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          text += `\n! Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
@@ -2201,9 +2481,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
-
       // Check if max experiments limit reached
-      const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+      const limitReached =
+        state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
@@ -2253,7 +2533,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ? "error"
             : "warning";
       const icon =
-        exp.status === "keep" ? "✓" : exp.status === "crash" ? "✗" : exp.status === "checks_failed" ? "⚠" : "–";
+        exp.status === "keep"
+          ? "✓"
+          : exp.status === "crash"
+            ? "✗"
+            : exp.status === "checks_failed"
+              ? "!"
+              : "–";
 
       let text =
         theme.fg(color, `${icon} `) +
@@ -2265,10 +2551,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         metricParts.push(`wall: ${d.wallClockSeconds.toFixed(1)}s`);
       }
       if (exp.metric > 0) {
-        metricParts.push(`${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`);
+        metricParts.push(
+          `${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`,
+        );
       }
       if (metricParts.length > 0) {
-        text += theme.fg("dim", " (") + theme.fg("warning", metricParts.join(theme.fg("dim", ", "))) + theme.fg("dim", ")");
+        text +=
+          theme.fg("dim", " (") +
+          theme.fg("warning", metricParts.join(theme.fg("dim", ", "))) +
+          theme.fg("dim", ")");
       }
 
       text += " " + theme.fg("muted", exp.description);
@@ -2278,7 +2569,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Find the actual best kept metric in the current segment
         let best = s.bestMetric;
         for (const r of s.results) {
-          if (r.segment === s.currentSegment && r.status === "keep" && r.metric > 0) {
+          if (
+            r.segment === s.currentSegment &&
+            r.status === "keep" &&
+            r.metric > 0
+          ) {
             if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
           }
         }
@@ -2311,8 +2606,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
-          ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
+        if (
+          !runtime.autoresearchMode &&
+          !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))
+        ) {
+          ctx.ui.notify(
+            "No experiments yet — run /autoresearch to get started",
+            "info",
+          );
         } else {
           ctx.ui.notify("No experiments yet", "info");
         }
@@ -2365,15 +2666,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
               // Add running experiment as next row in the list
               if (runtime.runningExperiment) {
-                const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
+                const elapsed = formatElapsed(
+                  Date.now() - runtime.runningExperiment.startedAt,
+                );
                 const frame = SPINNER[spinnerFrame % SPINNER.length];
                 const nextIdx = state.results.length + 1;
                 content.push(
                   truncateToWidth(
                     `  ${theme.fg("dim", String(nextIdx).padEnd(3))}` +
-                    theme.fg("warning", `${frame} running… ${elapsed}`),
-                    innerWidth
-                  )
+                      theme.fg("warning", `${frame} running… ${elapsed}`),
+                    innerWidth,
+                  ),
                 );
               }
 
@@ -2402,22 +2705,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               out.push(
                 truncateToWidth(
                   border("┌──") +
-                  border(" " + title + " ") +
-                  border("─".repeat(topFillLen) + "┐"),
-                  width
-                )
+                    border(" " + title + " ") +
+                    border("─".repeat(topFillLen) + "┐"),
+                  width,
+                ),
               );
 
               // Content rows with side borders: │ content │
-              const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
+              const visible = content.slice(
+                scrollOffset,
+                scrollOffset + viewportRows,
+              );
               for (const line of visible) {
                 const lineVisW = visibleWidth(line);
                 const padding = Math.max(0, innerWidth - lineVisW);
                 out.push(
                   truncateToWidth(
-                    border("│") + " " + line + " ".repeat(padding) + " " + border("│"),
-                    width
-                  )
+                    border("│") +
+                      " " +
+                      line +
+                      " ".repeat(padding) +
+                      " " +
+                      border("│"),
+                    width,
+                  ),
                 );
               }
               // Fill remaining viewport with empty bordered rows
@@ -2425,15 +2736,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                 out.push(
                   truncateToWidth(
                     border("│") + " ".repeat(width - 2) + border("│"),
-                    width
-                  )
+                    width,
+                  ),
                 );
               }
 
               // Bottom border with help text: └─────── ↑↓/j/k scroll • esc close ──┘
-              const scrollInfo = totalRows > viewportRows
-                ? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, totalRows)}/${totalRows}`
-                : "";
+              const scrollInfo =
+                totalRows > viewportRows
+                  ? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, totalRows)}/${totalRows}`
+                  : "";
               const helpText = `↑↓/j/k scroll • esc close${scrollInfo}`;
               const helpVisW = visibleWidth(helpText);
               // Budget: └ (1) + fill + space (1) + help + space (1) + ──┘ (3) = width
@@ -2441,10 +2753,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               out.push(
                 truncateToWidth(
                   border("└" + "─".repeat(bottomFillLen)) +
-                  theme.fg("dim", " " + helpText + " ") +
-                  border("──┘"),
-                  width
-                )
+                    theme.fg("dim", " " + helpText + " ") +
+                    border("──┘"),
+                  width,
+                ),
               );
 
               return out;
@@ -2452,8 +2764,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
             handleInput(data: string): void {
               const viewportRows = computeViewportRows();
-              const actualContent = renderDashboardLines(state, process.stdout.columns || 120, theme, 0);
-              const totalRows = actualContent.length + (runtime.runningExperiment ? 1 : 0);
+              const actualContent = renderDashboardLines(
+                state,
+                process.stdout.columns || 120,
+                theme,
+                0,
+              );
+              const totalRows =
+                actualContent.length + (runtime.runningExperiment ? 1 : 0);
               const maxScroll = Math.max(0, totalRows - viewportRows);
 
               if (matchesKey(data, "escape") || data === "q") {
@@ -2490,7 +2808,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             maxHeight: "90%",
             anchor: "center" as const,
           },
-        }
+        },
       );
     },
   });
@@ -2523,7 +2841,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
+        const jsonlPath = path.join(
+          resolveWorkDir(ctx.cwd),
+          "autoresearch.jsonl",
+        );
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
@@ -2537,21 +2858,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (fs.existsSync(jsonlPath)) {
           try {
             fs.unlinkSync(jsonlPath);
-            ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
+            ctx.ui.notify(
+              "Deleted autoresearch.jsonl and turned autoresearch mode OFF",
+              "info",
+            );
           } catch (error) {
             ctx.ui.notify(
               `Failed to delete autoresearch.jsonl: ${error instanceof Error ? error.message : String(error)}`,
-              "error"
+              "error",
             );
           }
         } else {
-          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
+          ctx.ui.notify(
+            "No autoresearch.jsonl found. Autoresearch mode OFF",
+            "info",
+          );
         }
         return;
       }
 
       if (runtime.autoresearchMode) {
-        ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
+        ctx.ui.notify(
+          "Autoresearch already active — use '/autoresearch off' to stop first",
+          "info",
+        );
         return;
       }
 
@@ -2562,12 +2892,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const hasRules = fs.existsSync(mdPath);
 
       if (hasRules) {
-        ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
-      } else {
-        ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
+        ctx.ui.notify(
+          "Autoresearch mode ON — rules loaded from autoresearch.md",
+          "info",
+        );
         pi.sendUserMessage(
-          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+          `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`,
+        );
+      } else {
+        ctx.ui.notify(
+          "Autoresearch mode ON — no autoresearch.md found, setting up",
+          "info",
+        );
+        pi.sendUserMessage(
+          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`,
         );
       }
     },
