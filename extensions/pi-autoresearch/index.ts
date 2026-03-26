@@ -46,6 +46,11 @@ const EXPERIMENT_MAX_LINES = 10;
 const EXPERIMENT_MAX_BYTES = 4 * 1024; // 4KB
 
 // ---------------------------------------------------------------------------
+// Tool registration tracking (ensures tools are registered at most once)
+// ---------------------------------------------------------------------------
+const registeredToolNames = new Set<string>();
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -1338,6 +1343,1202 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  // -----------------------------------------------------------------------
+  // Dynamic tool registration (load-autoresearch-tools command)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Register all autoresearch tools. Called by the /load-autoresearch-tools command.
+   * Uses registeredToolNames Set to ensure tools are only registered once.
+   */
+  const registerAutoresearchTools = (): void => {
+    // init_experiment tool
+    if (!registeredToolNames.has("init_experiment")) {
+      registeredToolNames.add("init_experiment");
+
+      // -----------------------------------------------------------------------
+      // init_experiment tool — one-time setup
+      // -----------------------------------------------------------------------
+
+      pi.registerTool({
+        name: "init_experiment",
+        label: "Init Experiment",
+        description:
+          "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to autoresearch.jsonl.",
+        promptSnippet:
+          "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
+        promptGuidelines: [
+          "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
+          "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
+          "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
+        ],
+        parameters: InitParams,
+
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const runtime = getRuntime(ctx);
+          const state = runtime.state;
+
+          // Validate working directory exists
+          const workDirError = validateWorkDir(ctx.cwd);
+          if (workDirError) {
+            return {
+              content: [{ type: "text", text: `❌ ${workDirError}` }],
+              details: {},
+            };
+          }
+
+          const isReinit = state.results.length > 0;
+
+          state.name = params.name;
+          state.metricName = params.metric_name;
+          state.metricUnit = params.metric_unit ?? "";
+          if (params.direction === "lower" || params.direction === "higher") {
+            state.bestDirection = params.direction;
+          }
+          // Start a new segment — keep history for dashboard, but reset baseline tracking.
+          // Old results remain accessible (filtered by segment in rendering).
+          if (isReinit) {
+            state.currentSegment++;
+          }
+          state.bestMetric = null;
+          state.secondaryMetrics = [];
+
+          state.confidence = null;
+
+          // Read max experiments from config file (config always in ctx.cwd)
+          state.maxExperiments = readMaxExperiments(ctx.cwd);
+
+          // Write config header to jsonl (append for re-init, create for first)
+          const workDir = resolveWorkDir(ctx.cwd);
+          try {
+            const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+            const config = JSON.stringify({
+              type: "config",
+              name: state.name,
+              metricName: state.metricName,
+              metricUnit: state.metricUnit,
+              bestDirection: state.bestDirection,
+            });
+            if (fs.existsSync(jsonlPath)) {
+              fs.appendFileSync(jsonlPath, config + "\n");
+            } else {
+              fs.writeFileSync(jsonlPath, config + "\n");
+            }
+          } catch (e) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+                },
+              ],
+              details: {},
+            };
+          }
+
+          runtime.autoresearchMode = true;
+          runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
+          updateWidget(ctx);
+
+          const reinitNote = isReinit
+            ? " (re-initialized — previous results archived, new baseline needed)"
+            : "";
+          const limitNote =
+            state.maxExperiments !== null
+              ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)`
+              : "";
+          const workDirNote =
+            workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+              },
+            ],
+            details: { state: cloneExperimentState(state) },
+          };
+        },
+
+        renderCall(args, theme) {
+          let text = theme.fg("toolTitle", theme.bold("init_experiment "));
+          text += theme.fg("accent", args.name ?? "");
+          return new Text(text, 0, 0);
+        },
+
+        renderResult(result, _options, theme) {
+          const t = result.content[0];
+          return new Text(t?.type === "text" ? t.text : "", 0, 0);
+        },
+      });
+    }
+
+    // run_experiment tool
+    if (!registeredToolNames.has("run_experiment")) {
+      registeredToolNames.add("run_experiment");
+
+      // -----------------------------------------------------------------------
+      // run_experiment tool
+      // -----------------------------------------------------------------------
+
+      pi.registerTool({
+        name: "run_experiment",
+        label: "Run Experiment",
+        description: `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
+        promptSnippet:
+          "Run a timed experiment command (captures duration, output, exit code)",
+        promptGuidelines: [
+          "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
+          "After run_experiment, always call log_experiment to record the result.",
+          "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
+        ],
+        parameters: RunParams,
+
+        async execute(_toolCallId, params, signal, onUpdate, ctx) {
+          const runtime = getRuntime(ctx);
+          const state = runtime.state;
+
+          // Validate working directory exists
+          const workDirError = validateWorkDir(ctx.cwd);
+          if (workDirError) {
+            return {
+              content: [{ type: "text", text: `❌ ${workDirError}` }],
+              details: {},
+            };
+          }
+          const workDir = resolveWorkDir(ctx.cwd);
+
+          // Block if max experiments limit already reached
+          if (state.maxExperiments !== null) {
+            const segCount = currentResults(
+              state.results,
+              state.currentSegment,
+            ).length;
+            if (segCount >= state.maxExperiments) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.`,
+                  },
+                ],
+                details: {},
+              };
+            }
+          }
+
+          const timeout = (params.timeout_seconds ?? 600) * 1000;
+
+          // Guard: if autoresearch.sh exists, only allow running it
+          const autoresearchShPath = path.join(workDir, "autoresearch.sh");
+          if (
+            fs.existsSync(autoresearchShPath) &&
+            !isAutoresearchShCommand(params.command)
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
+                },
+              ],
+              details: {
+                command: params.command,
+                exitCode: null,
+                durationSeconds: 0,
+                passed: false,
+                crashed: true,
+                timedOut: false,
+                tailOutput: "",
+                checksPass: null,
+                checksTimedOut: false,
+                checksOutput: "",
+                checksDuration: 0,
+              } as RunDetails,
+            };
+          }
+
+          advanceIterationTracking(runtime, ctx);
+          if (isContextExhausted(runtime, ctx)) {
+            runtime.autoresearchMode = false;
+            ctx.abort();
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved.",
+                },
+              ],
+              details: {},
+            };
+          }
+
+          runtime.runningExperiment = {
+            startedAt: Date.now(),
+            command: params.command,
+          };
+          updateWidget(ctx);
+          if (overlayTui) overlayTui.requestRender();
+
+          const t0 = Date.now();
+
+          // Spawn the process directly (like the bash tool) for streaming output
+          const getTempFile = createTempFileAllocator();
+          const {
+            exitCode,
+            killed: timedOut,
+            output,
+            tempFilePath: streamTempFile,
+            actualTotalBytes,
+          } = await new Promise<{
+            exitCode: number | null;
+            killed: boolean;
+            output: string;
+            tempFilePath: string | undefined;
+            actualTotalBytes: number;
+          }>((resolve, reject) => {
+            let processTimedOut = false;
+
+            const child = spawn("bash", ["-c", params.command], {
+              cwd: workDir,
+              detached: true,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+
+            // Rolling buffer for tail truncation (keep 2x what we need)
+            const chunks: Buffer[] = [];
+            let chunksBytes = 0;
+            const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
+
+            // Temp file for full output when it overflows
+            let tempFilePath: string | undefined;
+            let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
+            let totalBytes = 0;
+
+            // Cache for Buffer.concat — only rebuild when chunks change
+            let chunksGeneration = 0;
+            let cachedGeneration = -1;
+            let cachedText = "";
+
+            function getBufferText(): string {
+              if (cachedGeneration === chunksGeneration) return cachedText;
+              cachedText = Buffer.concat(chunks).toString("utf-8");
+              cachedGeneration = chunksGeneration;
+              return cachedText;
+            }
+
+            // Timer interval — update every second with elapsed time + tail output
+            const timerInterval = setInterval(() => {
+              if (!onUpdate) return;
+              const elapsed = formatElapsed(Date.now() - t0);
+              const trunc = truncateTail(getBufferText(), {
+                maxLines: DEFAULT_MAX_LINES,
+                maxBytes: DEFAULT_MAX_BYTES,
+              });
+              onUpdate({
+                content: [{ type: "text", text: trunc.content || "" }],
+                details: {
+                  phase: "running",
+                  elapsed,
+                  truncation: trunc.truncated ? trunc : undefined,
+                  fullOutputPath: tempFilePath,
+                },
+              });
+            }, 1000);
+
+            const handleData = (data: Buffer) => {
+              totalBytes += data.length;
+
+              // Start writing to temp file once we exceed the threshold
+              if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
+                tempFilePath = getTempFile();
+                tempFileStream = createWriteStream(tempFilePath);
+                for (const chunk of chunks) {
+                  tempFileStream.write(chunk);
+                }
+              }
+
+              if (tempFileStream) {
+                tempFileStream.write(data);
+              }
+
+              // Keep rolling buffer of recent data
+              chunks.push(data);
+              chunksBytes += data.length;
+
+              // Evict old chunks, then trim the first surviving chunk to a line
+              // boundary. This avoids splitting multi-byte UTF-8 characters that
+              // straddle chunk boundaries (which would produce U+FFFD on decode).
+              while (chunksBytes > maxChunksBytes && chunks.length > 1) {
+                const removed = chunks.shift()!;
+                chunksBytes -= removed.length;
+              }
+              // Trim first surviving chunk to a newline boundary
+              if (chunks.length > 0 && chunksBytes > maxChunksBytes) {
+                const buf = chunks[0];
+                const nlIdx = buf.indexOf(0x0a); // '\n'
+                if (nlIdx !== -1 && nlIdx < buf.length - 1) {
+                  chunks[0] = buf.subarray(nlIdx + 1);
+                  chunksBytes -= nlIdx + 1;
+                }
+              }
+
+              chunksGeneration++;
+            };
+
+            if (child.stdout) child.stdout.on("data", handleData);
+            if (child.stderr) child.stderr.on("data", handleData);
+
+            // Timeout
+            let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+            if (timeout > 0) {
+              timeoutHandle = setTimeout(() => {
+                processTimedOut = true;
+                if (child.pid) killTree(child.pid);
+              }, timeout);
+            }
+
+            // Abort signal — kill immediately if pid exists, otherwise queue for spawn.
+            // Using child.kill() as fallback ensures the signal is never silently swallowed.
+            const onAbort = () => {
+              if (child.pid) killTree(child.pid);
+              else {
+                // pid not yet assigned — try child.kill() which works without pid,
+                // and also queue killTree for spawn in case child.kill() isn't enough
+                // to clean up the full process tree.
+                child.kill();
+                child.once("spawn", () => {
+                  if (child.pid) killTree(child.pid);
+                });
+              }
+            };
+            if (signal) {
+              if (signal.aborted) {
+                onAbort();
+              } else {
+                signal.addEventListener("abort", onAbort, { once: true });
+              }
+            }
+
+            child.on("error", (err) => {
+              clearInterval(timerInterval);
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+              if (signal) signal.removeEventListener("abort", onAbort);
+              if (tempFileStream) tempFileStream.end();
+              reject(err);
+            });
+
+            child.on("close", (code) => {
+              clearInterval(timerInterval);
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+              if (signal) signal.removeEventListener("abort", onAbort);
+              if (tempFileStream) tempFileStream.end();
+
+              if (signal?.aborted) {
+                reject(new Error("aborted"));
+                return;
+              }
+
+              const fullBuffer = Buffer.concat(chunks);
+              resolve({
+                exitCode: code,
+                killed: processTimedOut,
+                output: fullBuffer.toString("utf-8"),
+                tempFilePath,
+                actualTotalBytes: totalBytes,
+              });
+            });
+          }).finally(() => {
+            runtime.runningExperiment = null;
+            updateWidget(ctx);
+            if (overlayTui) overlayTui.requestRender();
+          });
+
+          const durationSeconds = (Date.now() - t0) / 1000;
+          runtime.lastRunDuration = durationSeconds;
+          const benchmarkPassed = exitCode === 0 && !timedOut;
+
+          // Run backpressure checks if benchmark passed and checks file exists
+          let checksPass: boolean | null = null;
+          let checksTimedOut = false;
+          let checksOutput = "";
+          let checksDuration = 0;
+
+          const checksPath = path.join(workDir, "autoresearch.checks.sh");
+          if (benchmarkPassed && fs.existsSync(checksPath)) {
+            const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
+            const ct0 = Date.now();
+            try {
+              const checksResult = await pi.exec("bash", [checksPath], {
+                signal,
+                timeout: checksTimeout,
+                cwd: workDir,
+              });
+              checksDuration = (Date.now() - ct0) / 1000;
+              checksTimedOut = !!checksResult.killed;
+              checksPass = checksResult.code === 0 && !checksResult.killed;
+              checksOutput = (
+                checksResult.stdout +
+                "\n" +
+                checksResult.stderr
+              ).trim();
+            } catch (e) {
+              checksDuration = (Date.now() - ct0) / 1000;
+              checksPass = false;
+              checksOutput = e instanceof Error ? e.message : String(e);
+            }
+          }
+
+          // Store checks result for log_experiment gate
+          runtime.lastRunChecks =
+            checksPass !== null
+              ? { pass: checksPass, output: checksOutput, duration: checksDuration }
+              : null;
+
+          const passed = benchmarkPassed && (checksPass === null || checksPass);
+
+          // Reuse streaming temp file if it exists, otherwise create one for large output
+          let fullOutputPath: string | undefined = streamTempFile;
+          const totalLines = output.split("\n").length;
+          if (
+            !fullOutputPath &&
+            (actualTotalBytes > EXPERIMENT_MAX_BYTES ||
+              totalLines > EXPERIMENT_MAX_LINES)
+          ) {
+            fullOutputPath = getTempFile();
+            fs.writeFileSync(fullOutputPath, output);
+          }
+
+          // Wider truncation for TUI display (details.tailOutput)
+          const displayTruncation = truncateTail(output, {
+            maxLines: DEFAULT_MAX_LINES,
+            maxBytes: DEFAULT_MAX_BYTES,
+          });
+
+          // Tight truncation for LLM context (10 lines / 4KB)
+          const llmTruncation = truncateTail(output, {
+            maxLines: EXPERIMENT_MAX_LINES,
+            maxBytes: EXPERIMENT_MAX_BYTES,
+          });
+
+          // Parse structured METRIC lines from output
+          const parsedMetricMap = parseMetricLines(output);
+          const parsedMetrics =
+            parsedMetricMap.size > 0 ? Object.fromEntries(parsedMetricMap) : null;
+          const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
+
+          const details: RunDetails = {
+            command: params.command,
+            exitCode,
+            durationSeconds,
+            passed,
+            crashed: !passed,
+            timedOut,
+            tailOutput: displayTruncation.content,
+            checksPass,
+            checksTimedOut,
+            checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
+            checksDuration,
+            parsedMetrics,
+            parsedPrimary,
+            metricName: state.metricName,
+            metricUnit: state.metricUnit,
+          };
+
+          // Build LLM response
+          let text = "";
+          if (details.timedOut) {
+            text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
+          } else if (!benchmarkPassed) {
+            text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
+          } else if (checksTimedOut) {
+            text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+            text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
+            text += `Log this as 'checks_failed' — the benchmark metric is valid but checks timed out.\n`;
+          } else if (checksPass === false) {
+            text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+            text += `💥 CHECKS FAILED (autoresearch.checks.sh) in ${checksDuration.toFixed(1)}s\n`;
+            text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
+          } else {
+            text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
+            if (checksPass === true) {
+              text += `✅ Checks passed in ${checksDuration.toFixed(1)}s\n`;
+            }
+          }
+
+          if (state.bestMetric !== null) {
+            text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
+          }
+
+          // Show parsed METRIC lines to the LLM
+          if (parsedMetrics) {
+            const secondary = Object.entries(parsedMetrics).filter(
+              ([k]) => k !== state.metricName,
+            );
+
+            // Human-readable summary
+            text += `\n📐 Parsed metrics:`;
+            if (parsedPrimary !== null) {
+              text += ` ★ ${state.metricName}=${formatNum(parsedPrimary, state.metricUnit)}`;
+            }
+            for (const [name, value] of secondary) {
+              // Infer unit from name suffix for display
+              const sm = state.secondaryMetrics.find((m) => m.name === name);
+              const unit = sm?.unit ?? "";
+              text += ` ${name}=${formatNum(value, unit)}`;
+            }
+
+            // Machine-ready values for log_experiment (raw numbers, not formatted)
+            text += `\nUse these values directly in log_experiment (metric: ${parsedPrimary ?? "?"}, metrics: {${secondary.map(([k, v]) => `"${k}": ${v}`).join(", ")}})\n`;
+          }
+
+          text += `\n${llmTruncation.content}`;
+
+          if (llmTruncation.truncated) {
+            if (llmTruncation.truncatedBy === "lines") {
+              text += `\n\n[Showing last ${llmTruncation.outputLines} of ${llmTruncation.totalLines} lines.`;
+            } else {
+              text += `\n\n[Showing last ${llmTruncation.outputLines} lines (${formatSize(EXPERIMENT_MAX_BYTES)} limit).`;
+            }
+            if (fullOutputPath) {
+              text += ` Full output: ${fullOutputPath}`;
+            }
+            text += `]`;
+          }
+
+          if (checksPass === false) {
+            text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
+          }
+
+          return {
+            content: [{ type: "text", text }],
+            details: {
+              ...details,
+              truncation: llmTruncation.truncated ? llmTruncation : undefined,
+              fullOutputPath,
+            },
+          };
+        },
+
+        renderCall(args, theme) {
+          let text = theme.fg("toolTitle", theme.bold("run_experiment "));
+          text += theme.fg("muted", args.command);
+          if (args.timeout_seconds) {
+            text += theme.fg("dim", ` (timeout: ${args.timeout_seconds}s)`);
+          }
+          return new Text(text, 0, 0);
+        },
+
+        renderResult(result, { expanded, isPartial }, theme) {
+          const PREVIEW_LINES = 5;
+
+          if (isPartial) {
+            // Streaming: show elapsed timer + tail of output
+            const d = result.details as
+              | {
+                  phase?: string;
+                  elapsed?: string;
+                  truncation?: any;
+                  fullOutputPath?: string;
+                }
+              | undefined;
+            const elapsed = d?.elapsed ?? "";
+            const outputText =
+              result.content[0]?.type === "text" ? result.content[0].text : "";
+
+            let text = theme.fg(
+              "warning",
+              `⏳ Running${elapsed ? ` ${elapsed}` : ""}…`,
+            );
+
+            // Always show tail of streaming output (like bash tool shows preview lines)
+            if (outputText) {
+              const lines = outputText.split("\n");
+              const maxLines = expanded ? 20 : PREVIEW_LINES;
+              const tail = lines.slice(-maxLines).join("\n");
+              if (tail.trim()) {
+                text += "\n" + theme.fg("dim", tail);
+              }
+            }
+
+            return new Text(text, 0, 0);
+          }
+
+          const d = result.details as
+            | (RunDetails & { truncation?: any; fullOutputPath?: string })
+            | undefined;
+          if (!d) {
+            const t = result.content[0];
+            return new Text(t?.type === "text" ? t.text : "", 0, 0);
+          }
+
+          // Helper: append tail output preview or full output
+          const appendOutput = (text: string, output: string): string => {
+            if (!output) return text;
+            const lines = output.split("\n");
+            if (expanded) {
+              text += "\n" + theme.fg("dim", output.slice(-2000));
+            } else {
+              const tail = lines.slice(-PREVIEW_LINES).join("\n");
+              if (tail.trim()) {
+                const hidden = lines.length - PREVIEW_LINES;
+                if (hidden > 0) {
+                  text += "\n" + theme.fg("muted", `… ${hidden} more lines`);
+                }
+                text += "\n" + theme.fg("dim", tail);
+              }
+            }
+            return text;
+          };
+
+          if (d.timedOut) {
+            let text = theme.fg(
+              "error",
+              `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`,
+            );
+            text = appendOutput(text, d.tailOutput);
+            return new Text(text, 0, 0);
+          }
+
+          // Helper: format parsed primary metric suffix (empty string if not available)
+          const parsedSuffix =
+            d.parsedPrimary !== null
+              ? theme.fg(
+                  "accent",
+                  `, ${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
+                )
+              : "";
+
+          if (d.checksTimedOut) {
+            let text =
+              theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
+              parsedSuffix +
+              theme.fg(
+                "error",
+                ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`,
+              );
+            text = appendOutput(text, d.checksOutput);
+            return new Text(text, 0, 0);
+          }
+
+          if (d.checksPass === false) {
+            let text =
+              theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
+              parsedSuffix +
+              theme.fg(
+                "error",
+                ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`,
+              );
+            text = appendOutput(text, d.checksOutput);
+            return new Text(text, 0, 0);
+          }
+
+          if (d.crashed) {
+            let text =
+              theme.fg(
+                "error",
+                `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`,
+              ) + parsedSuffix;
+            text = appendOutput(text, d.tailOutput);
+            return new Text(text, 0, 0);
+          }
+
+          let text = theme.fg("success", "✅ ");
+
+          // Show wall-clock and parsed primary metric together
+          const parts: string[] = [`wall: ${d.durationSeconds.toFixed(1)}s`];
+          if (d.parsedPrimary !== null) {
+            parts.push(
+              `${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
+            );
+          }
+          text += theme.fg("accent", parts.join(", "));
+
+          if (d.checksPass === true) {
+            text += theme.fg(
+              "success",
+              ` ✓ checks ${d.checksDuration.toFixed(1)}s`,
+            );
+          }
+
+          if (d.truncation?.truncated && d.fullOutputPath) {
+            text += theme.fg("warning", " (truncated)");
+          }
+
+          text = appendOutput(text, d.tailOutput);
+
+          if (expanded && d.truncation?.truncated && d.fullOutputPath) {
+            if (d.truncation.truncatedBy === "lines") {
+              text +=
+                "\n" +
+                theme.fg(
+                  "warning",
+                  `[Truncated: showing ${d.truncation.outputLines} of ${d.truncation.totalLines} lines. Full output: ${d.fullOutputPath}]`,
+                );
+            } else {
+              text +=
+                "\n" +
+                theme.fg(
+                  "warning",
+                  `[Truncated: ${d.truncation.outputLines} lines shown (${formatSize(EXPERIMENT_MAX_BYTES)} limit). Full output: ${d.fullOutputPath}]`,
+                );
+            }
+          }
+
+          return new Text(text, 0, 0);
+        },
+      });
+    }
+
+    // log_experiment tool
+    if (!registeredToolNames.has("log_experiment")) {
+      registeredToolNames.add("log_experiment");
+
+      // -----------------------------------------------------------------------
+      // log_experiment tool
+      // -----------------------------------------------------------------------
+
+      pi.registerTool({
+        name: "log_experiment",
+        label: "Log Experiment",
+        description:
+          "Record an experiment result. Tracks metrics, updates the status widget and dashboard. Call after every run_experiment.",
+        promptSnippet:
+          "Log experiment result (commit, metric, status, description)",
+        promptGuidelines: [
+          "Always call log_experiment after run_experiment to record the result.",
+          "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
+          "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
+          "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
+          "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
+          'Always include the asi parameter. At minimum: {"hypothesis": "what you tried"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.',
+        ],
+        parameters: LogParams,
+
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const runtime = getRuntime(ctx);
+          const state = runtime.state;
+
+          // Validate working directory exists
+          const workDirError = validateWorkDir(ctx.cwd);
+          if (workDirError) {
+            return {
+              content: [{ type: "text", text: `❌ ${workDirError}` }],
+              details: {},
+            };
+          }
+          const workDir = resolveWorkDir(ctx.cwd);
+          const secondaryMetrics = params.metrics ?? {};
+
+          // Gate: prevent "keep" when last run's checks failed
+          if (
+            params.status === "keep" &&
+            runtime.lastRunChecks &&
+            !runtime.lastRunChecks.pass
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+                },
+              ],
+              details: {},
+            };
+          }
+
+          // Validate secondary metrics consistency (after first experiment establishes them)
+          if (state.secondaryMetrics.length > 0) {
+            const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
+            const providedNames = new Set(Object.keys(secondaryMetrics));
+
+            // Check for missing metrics
+            const missing = [...knownNames].filter((n) => !providedNames.has(n));
+            if (missing.length > 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+                  },
+                ],
+                details: {},
+              };
+            }
+
+            // Check for new metrics not yet tracked
+            const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
+            if (newMetrics.length > 0 && !params.force) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
+                  },
+                ],
+                details: {},
+              };
+            }
+          }
+
+          // ASI: agent-supplied free-form diagnostics
+          const mergedASI =
+            params.asi && Object.keys(params.asi).length > 0
+              ? (params.asi as ASI)
+              : undefined;
+
+          const iterationTokens = lastIterationTokens(runtime);
+
+          const experiment: ExperimentResult = {
+            commit: params.commit.slice(0, 7),
+            metric: params.metric,
+            metrics: secondaryMetrics,
+            status: params.status,
+            description: params.description,
+            timestamp: Date.now(),
+            segment: state.currentSegment,
+            confidence: null,
+            iterationTokens,
+            asi: mergedASI,
+          };
+
+          state.results.push(experiment);
+          runtime.experimentsThisSession++;
+
+          // Register any new secondary metric names
+          for (const name of Object.keys(secondaryMetrics)) {
+            if (!state.secondaryMetrics.find((m) => m.name === name)) {
+              let unit = "";
+              if (name.endsWith("µs")) unit = "µs";
+              else if (name.endsWith("_ms")) unit = "ms";
+              else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+              else if (name.endsWith("_kb")) unit = "kb";
+              else if (name.endsWith("_mb")) unit = "mb";
+              state.secondaryMetrics.push({ name, unit });
+            }
+          }
+
+          // Baseline = first run in current segment
+          state.bestMetric = findBaselineMetric(
+            state.results,
+            state.currentSegment,
+          );
+
+          // Compute confidence score (best improvement as multiple of noise floor)
+          state.confidence = computeConfidence(
+            state.results,
+            state.currentSegment,
+            state.bestDirection,
+          );
+          experiment.confidence = state.confidence;
+
+          // Build response text
+          const segmentCount = currentResults(
+            state.results,
+            state.currentSegment,
+          ).length;
+          let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+
+          if (state.bestMetric !== null) {
+            text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
+            if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
+              const delta = params.metric - state.bestMetric;
+              const pct = ((delta / state.bestMetric) * 100).toFixed(1);
+              const sign = delta > 0 ? "+" : "";
+              text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
+            }
+          }
+
+          // Show secondary metrics
+          if (Object.keys(secondaryMetrics).length > 0) {
+            const baselines = findBaselineSecondary(
+              state.results,
+              state.currentSegment,
+              state.secondaryMetrics,
+            );
+            const parts: string[] = [];
+            for (const [name, value] of Object.entries(secondaryMetrics)) {
+              const def = state.secondaryMetrics.find((m) => m.name === name);
+              const unit = def?.unit ?? "";
+              let part = `${name}: ${formatNum(value, unit)}`;
+              const bv = baselines[name];
+              if (bv !== undefined && state.results.length > 1 && bv !== 0) {
+                const d = value - bv;
+                const p = ((d / bv) * 100).toFixed(1);
+                const s = d > 0 ? "+" : "";
+                part += ` (${s}${p}%)`;
+              }
+              parts.push(part);
+            }
+            text += `\nSecondary: ${parts.join("  ")}`;
+          }
+
+          // Show ASI summary
+          if (mergedASI) {
+            const asiParts: string[] = [];
+            for (const [k, v] of Object.entries(mergedASI)) {
+              const s = typeof v === "string" ? v : JSON.stringify(v);
+              asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
+            }
+            if (asiParts.length > 0) {
+              text += `\n📋 ASI: ${asiParts.join(" | ")}`;
+            }
+          }
+
+          // Show confidence score
+          if (state.confidence !== null) {
+            const confStr = state.confidence.toFixed(1);
+            if (state.confidence >= 2.0) {
+              text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
+            } else if (state.confidence >= 1.0) {
+              text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
+            } else {
+              text += `\n! Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+            }
+          }
+
+          text += `\n(${segmentCount} experiments`;
+          if (state.maxExperiments !== null) {
+            text += ` / ${state.maxExperiments} max`;
+          }
+          text += `)`;
+
+          // Auto-commit only on keep — discards/crashes get reverted anyway
+          if (params.status === "keep") {
+            try {
+              const resultData: Record<string, unknown> = {
+                status: params.status,
+                [state.metricName || "metric"]: params.metric,
+                ...secondaryMetrics,
+              };
+              const trailerJson = JSON.stringify(resultData);
+              const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
+
+              const execOpts = { cwd: workDir, timeout: 10000 };
+              const addResult = await pi.exec("git", ["add", "-A"], execOpts);
+              if (addResult.code !== 0) {
+                const addErr = (addResult.stdout + addResult.stderr).trim();
+                throw new Error(
+                  `git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`,
+                );
+              }
+
+              const diffResult = await pi.exec(
+                "git",
+                ["diff", "--cached", "--quiet"],
+                execOpts,
+              );
+              if (diffResult.code === 0) {
+                text += `\n📝 Git: nothing to commit (working tree clean)`;
+              } else {
+                const gitResult = await pi.exec(
+                  "git",
+                  ["commit", "-m", commitMsg],
+                  execOpts,
+                );
+                const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
+                if (gitResult.code === 0) {
+                  const firstLine = gitOutput.split("\n")[0] || "";
+                  text += `\n📝 Git: committed — ${firstLine}`;
+
+                  try {
+                    const shaResult = await pi.exec(
+                      "git",
+                      ["rev-parse", "--short=7", "HEAD"],
+                      { cwd: workDir, timeout: 5000 },
+                    );
+                    const newSha = (shaResult.stdout || "").trim();
+                    if (newSha && newSha.length >= 7) {
+                      experiment.commit = newSha;
+                    }
+                  } catch {
+                    // Keep the original commit hash if rev-parse fails
+                  }
+                } else {
+                  text += `\n! Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
+                }
+              }
+            } catch (e) {
+              text += `\n! Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          }
+
+          // Persist to autoresearch.jsonl (always, regardless of status)
+          try {
+            const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+            const jsonlEntry: Record<string, unknown> = {
+              run: state.results.length,
+              ...experiment,
+            };
+            // Only write asi if present (keep lines compact when no ASI)
+            if (!mergedASI) delete jsonlEntry.asi;
+            fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
+          } catch (e) {
+            text += `\n! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+          }
+
+          // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
+          if (params.status !== "keep") {
+            try {
+              const protectedFiles = [
+                "autoresearch.jsonl",
+                "autoresearch.md",
+                "autoresearch.ideas.md",
+                "autoresearch.sh",
+                "autoresearch.checks.sh",
+              ];
+              const stageCmd = protectedFiles
+                .map(
+                  (f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`,
+                )
+                .join("; ");
+              await pi.exec(
+                "bash",
+                ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`],
+                { cwd: workDir, timeout: 10000 },
+              );
+              text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+            } catch (e) {
+              text += `\n! Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          }
+
+          // Clear running experiment and checks state (log_experiment consumes the run)
+          const wallClockSeconds = runtime.lastRunDuration;
+          runtime.runningExperiment = null;
+          runtime.lastRunChecks = null;
+          runtime.lastRunDuration = null;
+
+          // Check if max experiments limit reached
+          const limitReached =
+            state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+          if (limitReached) {
+            text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
+            runtime.autoresearchMode = false;
+            ctx.abort();
+          }
+
+          updateWidget(ctx);
+
+          // Refresh fullscreen overlay if open
+          if (overlayTui) overlayTui.requestRender();
+
+          return {
+            content: [{ type: "text", text }],
+            details: {
+              experiment: { ...experiment, metrics: { ...experiment.metrics } },
+              state: cloneExperimentState(state),
+              wallClockSeconds,
+            } as LogDetails,
+          };
+        },
+
+        renderCall(args, theme) {
+          let text = theme.fg("toolTitle", theme.bold("log_experiment "));
+          const color =
+            args.status === "keep"
+              ? "success"
+              : args.status === "crash" || args.status === "checks_failed"
+                ? "error"
+                : "warning";
+          text += theme.fg(color, args.status);
+          text += " " + theme.fg("dim", args.description);
+          return new Text(text, 0, 0);
+        },
+
+        renderResult(result, _options, theme) {
+          const d = result.details as LogDetails | undefined;
+          if (!d) {
+            const t = result.content[0];
+            return new Text(t?.type === "text" ? t.text : "", 0, 0);
+          }
+
+          const { experiment: exp, state: s } = d;
+          const color =
+            exp.status === "keep"
+              ? "success"
+              : exp.status === "crash" || exp.status === "checks_failed"
+                ? "error"
+                : "warning";
+          const icon =
+            exp.status === "keep"
+              ? "✓"
+              : exp.status === "crash"
+                ? "✗"
+                : exp.status === "checks_failed"
+                  ? "!"
+                  : "–";
+
+          let text =
+            theme.fg(color, `${icon} `) +
+            theme.fg("accent", `#${s.results.length}`);
+
+          // Show wall-clock and primary metric together
+          const metricParts: string[] = [];
+          if (d.wallClockSeconds !== null && d.wallClockSeconds !== undefined) {
+            metricParts.push(`wall: ${d.wallClockSeconds.toFixed(1)}s`);
+          }
+          if (exp.metric > 0) {
+            metricParts.push(
+              `${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`,
+            );
+          }
+          if (metricParts.length > 0) {
+            text +=
+              theme.fg("dim", " (") +
+              theme.fg("warning", metricParts.join(theme.fg("dim", ", "))) +
+              theme.fg("dim", ")");
+          }
+
+          text += " " + theme.fg("muted", exp.description);
+
+          // Show best metric for context (overall best, not just this run)
+          if (s.bestMetric !== null) {
+            // Find the actual best kept metric in the current segment
+            let best = s.bestMetric;
+            for (const r of s.results) {
+              if (
+                r.segment === s.currentSegment &&
+                r.status === "keep" &&
+                r.metric > 0
+              ) {
+                if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
+              }
+            }
+            text +=
+              theme.fg("dim", " │ ") +
+              theme.fg("warning", `★ best: ${formatNum(best, s.metricUnit)}`);
+          }
+
+          // Show secondary metrics inline
+          if (Object.keys(exp.metrics).length > 0) {
+            const parts: string[] = [];
+            for (const [name, value] of Object.entries(exp.metrics)) {
+              const def = s.secondaryMetrics.find((m) => m.name === name);
+              parts.push(`${name}=${formatNum(value, def?.unit ?? "")}`);
+            }
+            text += theme.fg("dim", `  ${parts.join(" ")}`);
+          }
+
+          return new Text(text, 0, 0);
+        },
+      });
+    }
+  };
+
+  // Register the load-autoresearch-tools command
+  pi.registerCommand("load-autoresearch-tools", {
+    description: "Register the autoresearch tools (init_experiment, run_experiment, log_experiment). Call this once per session before using any autoresearch tools.",
+    handler: async (_args, ctx) => {
+      if (registeredToolNames.has("init_experiment")) {
+        ctx.ui.notify("autoresearch tools already loaded", "info");
+        return;
+      }
+      registerAutoresearchTools();
+      ctx.ui.notify("autoresearch tools loaded", "info");
+    },
+  });
+
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_switch", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_fork", async (_e, ctx) => reconstructState(ctx));
@@ -1437,1163 +2638,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return {
       systemPrompt: event.systemPrompt + extra,
     };
-  });
-
-  // -----------------------------------------------------------------------
-  // init_experiment tool — one-time setup
-  // -----------------------------------------------------------------------
-
-  pi.registerTool({
-    name: "init_experiment",
-    label: "Init Experiment",
-    description:
-      "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to autoresearch.jsonl.",
-    promptSnippet:
-      "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
-    promptGuidelines: [
-      "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
-      "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
-      "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
-    ],
-    parameters: InitParams,
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
-        return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
-          details: {},
-        };
-      }
-
-      const isReinit = state.results.length > 0;
-
-      state.name = params.name;
-      state.metricName = params.metric_name;
-      state.metricUnit = params.metric_unit ?? "";
-      if (params.direction === "lower" || params.direction === "higher") {
-        state.bestDirection = params.direction;
-      }
-      // Start a new segment — keep history for dashboard, but reset baseline tracking.
-      // Old results remain accessible (filtered by segment in rendering).
-      if (isReinit) {
-        state.currentSegment++;
-      }
-      state.bestMetric = null;
-      state.secondaryMetrics = [];
-      state.confidence = null;
-
-      // Read max experiments from config file (config always in ctx.cwd)
-      state.maxExperiments = readMaxExperiments(ctx.cwd);
-
-      // Write config header to jsonl (append for re-init, create for first)
-      const workDir = resolveWorkDir(ctx.cwd);
-      try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const config = JSON.stringify({
-          type: "config",
-          name: state.name,
-          metricName: state.metricName,
-          metricUnit: state.metricUnit,
-          bestDirection: state.bestDirection,
-        });
-        if (fs.existsSync(jsonlPath)) {
-          fs.appendFileSync(jsonlPath, config + "\n");
-        } else {
-          fs.writeFileSync(jsonlPath, config + "\n");
-        }
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          details: {},
-        };
-      }
-
-      runtime.autoresearchMode = true;
-      runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
-      updateWidget(ctx);
-
-      const reinitNote = isReinit
-        ? " (re-initialized — previous results archived, new baseline needed)"
-        : "";
-      const limitNote =
-        state.maxExperiments !== null
-          ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)`
-          : "";
-      const workDirNote =
-        workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
-          },
-        ],
-        details: { state: cloneExperimentState(state) },
-      };
-    },
-
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("init_experiment "));
-      text += theme.fg("accent", args.name ?? "");
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const t = result.content[0];
-      return new Text(t?.type === "text" ? t.text : "", 0, 0);
-    },
-  });
-
-  // -----------------------------------------------------------------------
-  // run_experiment tool
-  // -----------------------------------------------------------------------
-
-  pi.registerTool({
-    name: "run_experiment",
-    label: "Run Experiment",
-    description: `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
-    promptSnippet:
-      "Run a timed experiment command (captures duration, output, exit code)",
-    promptGuidelines: [
-      "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
-      "After run_experiment, always call log_experiment to record the result.",
-      "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
-    ],
-    parameters: RunParams,
-
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
-        return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
-          details: {},
-        };
-      }
-      const workDir = resolveWorkDir(ctx.cwd);
-
-      // Block if max experiments limit already reached
-      if (state.maxExperiments !== null) {
-        const segCount = currentResults(
-          state.results,
-          state.currentSegment,
-        ).length;
-        if (segCount >= state.maxExperiments) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `🛑 Maximum experiments reached (${state.maxExperiments}). The experiment loop is done. To continue, call init_experiment to start a new segment.`,
-              },
-            ],
-            details: {},
-          };
-        }
-      }
-
-      const timeout = (params.timeout_seconds ?? 600) * 1000;
-
-      // Guard: if autoresearch.sh exists, only allow running it
-      const autoresearchShPath = path.join(workDir, "autoresearch.sh");
-      if (
-        fs.existsSync(autoresearchShPath) &&
-        !isAutoresearchShCommand(params.command)
-      ) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
-            },
-          ],
-          details: {
-            command: params.command,
-            exitCode: null,
-            durationSeconds: 0,
-            passed: false,
-            crashed: true,
-            timedOut: false,
-            tailOutput: "",
-            checksPass: null,
-            checksTimedOut: false,
-            checksOutput: "",
-            checksDuration: 0,
-          } as RunDetails,
-        };
-      }
-
-      advanceIterationTracking(runtime, ctx);
-      if (isContextExhausted(runtime, ctx)) {
-        runtime.autoresearchMode = false;
-        ctx.abort();
-        return {
-          content: [
-            {
-              type: "text",
-              text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved.",
-            },
-          ],
-          details: {},
-        };
-      }
-
-      runtime.runningExperiment = {
-        startedAt: Date.now(),
-        command: params.command,
-      };
-      updateWidget(ctx);
-      if (overlayTui) overlayTui.requestRender();
-
-      const t0 = Date.now();
-
-      // Spawn the process directly (like the bash tool) for streaming output
-      const getTempFile = createTempFileAllocator();
-      const {
-        exitCode,
-        killed: timedOut,
-        output,
-        tempFilePath: streamTempFile,
-        actualTotalBytes,
-      } = await new Promise<{
-        exitCode: number | null;
-        killed: boolean;
-        output: string;
-        tempFilePath: string | undefined;
-        actualTotalBytes: number;
-      }>((resolve, reject) => {
-        let processTimedOut = false;
-
-        const child = spawn("bash", ["-c", params.command], {
-          cwd: workDir,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        // Rolling buffer for tail truncation (keep 2x what we need)
-        const chunks: Buffer[] = [];
-        let chunksBytes = 0;
-        const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
-
-        // Temp file for full output when it overflows
-        let tempFilePath: string | undefined;
-        let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
-        let totalBytes = 0;
-
-        // Cache for Buffer.concat — only rebuild when chunks change
-        let chunksGeneration = 0;
-        let cachedGeneration = -1;
-        let cachedText = "";
-
-        function getBufferText(): string {
-          if (cachedGeneration === chunksGeneration) return cachedText;
-          cachedText = Buffer.concat(chunks).toString("utf-8");
-          cachedGeneration = chunksGeneration;
-          return cachedText;
-        }
-
-        // Timer interval — update every second with elapsed time + tail output
-        const timerInterval = setInterval(() => {
-          if (!onUpdate) return;
-          const elapsed = formatElapsed(Date.now() - t0);
-          const trunc = truncateTail(getBufferText(), {
-            maxLines: DEFAULT_MAX_LINES,
-            maxBytes: DEFAULT_MAX_BYTES,
-          });
-          onUpdate({
-            content: [{ type: "text", text: trunc.content || "" }],
-            details: {
-              phase: "running",
-              elapsed,
-              truncation: trunc.truncated ? trunc : undefined,
-              fullOutputPath: tempFilePath,
-            },
-          });
-        }, 1000);
-
-        const handleData = (data: Buffer) => {
-          totalBytes += data.length;
-
-          // Start writing to temp file once we exceed the threshold
-          if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-            tempFilePath = getTempFile();
-            tempFileStream = createWriteStream(tempFilePath);
-            for (const chunk of chunks) {
-              tempFileStream.write(chunk);
-            }
-          }
-
-          if (tempFileStream) {
-            tempFileStream.write(data);
-          }
-
-          // Keep rolling buffer of recent data
-          chunks.push(data);
-          chunksBytes += data.length;
-
-          // Evict old chunks, then trim the first surviving chunk to a line
-          // boundary. This avoids splitting multi-byte UTF-8 characters that
-          // straddle chunk boundaries (which would produce U+FFFD on decode).
-          while (chunksBytes > maxChunksBytes && chunks.length > 1) {
-            const removed = chunks.shift()!;
-            chunksBytes -= removed.length;
-          }
-          // Trim first surviving chunk to a newline boundary
-          if (chunks.length > 0 && chunksBytes > maxChunksBytes) {
-            const buf = chunks[0];
-            const nlIdx = buf.indexOf(0x0a); // '\n'
-            if (nlIdx !== -1 && nlIdx < buf.length - 1) {
-              chunks[0] = buf.subarray(nlIdx + 1);
-              chunksBytes -= nlIdx + 1;
-            }
-          }
-
-          chunksGeneration++;
-        };
-
-        if (child.stdout) child.stdout.on("data", handleData);
-        if (child.stderr) child.stderr.on("data", handleData);
-
-        // Timeout
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        if (timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            processTimedOut = true;
-            if (child.pid) killTree(child.pid);
-          }, timeout);
-        }
-
-        // Abort signal — kill immediately if pid exists, otherwise queue for spawn.
-        // Using child.kill() as fallback ensures the signal is never silently swallowed.
-        const onAbort = () => {
-          if (child.pid) killTree(child.pid);
-          else {
-            // pid not yet assigned — try child.kill() which works without pid,
-            // and also queue killTree for spawn in case child.kill() isn't enough
-            // to clean up the full process tree.
-            child.kill();
-            child.once("spawn", () => {
-              if (child.pid) killTree(child.pid);
-            });
-          }
-        };
-        if (signal) {
-          if (signal.aborted) {
-            onAbort();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        }
-
-        child.on("error", (err) => {
-          clearInterval(timerInterval);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-          reject(err);
-        });
-
-        child.on("close", (code) => {
-          clearInterval(timerInterval);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-
-          if (signal?.aborted) {
-            reject(new Error("aborted"));
-            return;
-          }
-
-          const fullBuffer = Buffer.concat(chunks);
-          resolve({
-            exitCode: code,
-            killed: processTimedOut,
-            output: fullBuffer.toString("utf-8"),
-            tempFilePath,
-            actualTotalBytes: totalBytes,
-          });
-        });
-      }).finally(() => {
-        runtime.runningExperiment = null;
-        updateWidget(ctx);
-        if (overlayTui) overlayTui.requestRender();
-      });
-
-      const durationSeconds = (Date.now() - t0) / 1000;
-      runtime.lastRunDuration = durationSeconds;
-      const benchmarkPassed = exitCode === 0 && !timedOut;
-
-      // Run backpressure checks if benchmark passed and checks file exists
-      let checksPass: boolean | null = null;
-      let checksTimedOut = false;
-      let checksOutput = "";
-      let checksDuration = 0;
-
-      const checksPath = path.join(workDir, "autoresearch.checks.sh");
-      if (benchmarkPassed && fs.existsSync(checksPath)) {
-        const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
-        const ct0 = Date.now();
-        try {
-          const checksResult = await pi.exec("bash", [checksPath], {
-            signal,
-            timeout: checksTimeout,
-            cwd: workDir,
-          });
-          checksDuration = (Date.now() - ct0) / 1000;
-          checksTimedOut = !!checksResult.killed;
-          checksPass = checksResult.code === 0 && !checksResult.killed;
-          checksOutput = (
-            checksResult.stdout +
-            "\n" +
-            checksResult.stderr
-          ).trim();
-        } catch (e) {
-          checksDuration = (Date.now() - ct0) / 1000;
-          checksPass = false;
-          checksOutput = e instanceof Error ? e.message : String(e);
-        }
-      }
-
-      // Store checks result for log_experiment gate
-      runtime.lastRunChecks =
-        checksPass !== null
-          ? { pass: checksPass, output: checksOutput, duration: checksDuration }
-          : null;
-
-      const passed = benchmarkPassed && (checksPass === null || checksPass);
-
-      // Reuse streaming temp file if it exists, otherwise create one for large output
-      let fullOutputPath: string | undefined = streamTempFile;
-      const totalLines = output.split("\n").length;
-      if (
-        !fullOutputPath &&
-        (actualTotalBytes > EXPERIMENT_MAX_BYTES ||
-          totalLines > EXPERIMENT_MAX_LINES)
-      ) {
-        fullOutputPath = getTempFile();
-        fs.writeFileSync(fullOutputPath, output);
-      }
-
-      // Wider truncation for TUI display (details.tailOutput)
-      const displayTruncation = truncateTail(output, {
-        maxLines: DEFAULT_MAX_LINES,
-        maxBytes: DEFAULT_MAX_BYTES,
-      });
-
-      // Tight truncation for LLM context (10 lines / 4KB)
-      const llmTruncation = truncateTail(output, {
-        maxLines: EXPERIMENT_MAX_LINES,
-        maxBytes: EXPERIMENT_MAX_BYTES,
-      });
-
-      // Parse structured METRIC lines from output
-      const parsedMetricMap = parseMetricLines(output);
-      const parsedMetrics =
-        parsedMetricMap.size > 0 ? Object.fromEntries(parsedMetricMap) : null;
-      const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
-
-      const details: RunDetails = {
-        command: params.command,
-        exitCode,
-        durationSeconds,
-        passed,
-        crashed: !passed,
-        timedOut,
-        tailOutput: displayTruncation.content,
-        checksPass,
-        checksTimedOut,
-        checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
-        checksDuration,
-        parsedMetrics,
-        parsedPrimary,
-        metricName: state.metricName,
-        metricUnit: state.metricUnit,
-      };
-
-      // Build LLM response
-      let text = "";
-      if (details.timedOut) {
-        text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
-      } else if (!benchmarkPassed) {
-        text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
-      } else if (checksTimedOut) {
-        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
-        text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
-        text += `Log this as 'checks_failed' — the benchmark metric is valid but checks timed out.\n`;
-      } else if (checksPass === false) {
-        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
-        text += `💥 CHECKS FAILED (autoresearch.checks.sh) in ${checksDuration.toFixed(1)}s\n`;
-        text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
-      } else {
-        text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
-        if (checksPass === true) {
-          text += `✅ Checks passed in ${checksDuration.toFixed(1)}s\n`;
-        }
-      }
-
-      if (state.bestMetric !== null) {
-        text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
-      }
-
-      // Show parsed METRIC lines to the LLM
-      if (parsedMetrics) {
-        const secondary = Object.entries(parsedMetrics).filter(
-          ([k]) => k !== state.metricName,
-        );
-
-        // Human-readable summary
-        text += `\n📐 Parsed metrics:`;
-        if (parsedPrimary !== null) {
-          text += ` ★ ${state.metricName}=${formatNum(parsedPrimary, state.metricUnit)}`;
-        }
-        for (const [name, value] of secondary) {
-          // Infer unit from name suffix for display
-          const sm = state.secondaryMetrics.find((m) => m.name === name);
-          const unit = sm?.unit ?? "";
-          text += ` ${name}=${formatNum(value, unit)}`;
-        }
-
-        // Machine-ready values for log_experiment (raw numbers, not formatted)
-        text += `\nUse these values directly in log_experiment (metric: ${parsedPrimary ?? "?"}, metrics: {${secondary.map(([k, v]) => `"${k}": ${v}`).join(", ")}})\n`;
-      }
-
-      text += `\n${llmTruncation.content}`;
-
-      if (llmTruncation.truncated) {
-        if (llmTruncation.truncatedBy === "lines") {
-          text += `\n\n[Showing last ${llmTruncation.outputLines} of ${llmTruncation.totalLines} lines.`;
-        } else {
-          text += `\n\n[Showing last ${llmTruncation.outputLines} lines (${formatSize(EXPERIMENT_MAX_BYTES)} limit).`;
-        }
-        if (fullOutputPath) {
-          text += ` Full output: ${fullOutputPath}`;
-        }
-        text += `]`;
-      }
-
-      if (checksPass === false) {
-        text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
-      }
-
-      return {
-        content: [{ type: "text", text }],
-        details: {
-          ...details,
-          truncation: llmTruncation.truncated ? llmTruncation : undefined,
-          fullOutputPath,
-        },
-      };
-    },
-
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("run_experiment "));
-      text += theme.fg("muted", args.command);
-      if (args.timeout_seconds) {
-        text += theme.fg("dim", ` (timeout: ${args.timeout_seconds}s)`);
-      }
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, { expanded, isPartial }, theme) {
-      const PREVIEW_LINES = 5;
-
-      if (isPartial) {
-        // Streaming: show elapsed timer + tail of output
-        const d = result.details as
-          | {
-              phase?: string;
-              elapsed?: string;
-              truncation?: any;
-              fullOutputPath?: string;
-            }
-          | undefined;
-        const elapsed = d?.elapsed ?? "";
-        const outputText =
-          result.content[0]?.type === "text" ? result.content[0].text : "";
-
-        let text = theme.fg(
-          "warning",
-          `⏳ Running${elapsed ? ` ${elapsed}` : ""}…`,
-        );
-
-        // Always show tail of streaming output (like bash tool shows preview lines)
-        if (outputText) {
-          const lines = outputText.split("\n");
-          const maxLines = expanded ? 20 : PREVIEW_LINES;
-          const tail = lines.slice(-maxLines).join("\n");
-          if (tail.trim()) {
-            text += "\n" + theme.fg("dim", tail);
-          }
-        }
-
-        return new Text(text, 0, 0);
-      }
-
-      const d = result.details as
-        | (RunDetails & { truncation?: any; fullOutputPath?: string })
-        | undefined;
-      if (!d) {
-        const t = result.content[0];
-        return new Text(t?.type === "text" ? t.text : "", 0, 0);
-      }
-
-      // Helper: append tail output preview or full output
-      const appendOutput = (text: string, output: string): string => {
-        if (!output) return text;
-        const lines = output.split("\n");
-        if (expanded) {
-          text += "\n" + theme.fg("dim", output.slice(-2000));
-        } else {
-          const tail = lines.slice(-PREVIEW_LINES).join("\n");
-          if (tail.trim()) {
-            const hidden = lines.length - PREVIEW_LINES;
-            if (hidden > 0) {
-              text += "\n" + theme.fg("muted", `… ${hidden} more lines`);
-            }
-            text += "\n" + theme.fg("dim", tail);
-          }
-        }
-        return text;
-      };
-
-      if (d.timedOut) {
-        let text = theme.fg(
-          "error",
-          `⏰ TIMEOUT ${d.durationSeconds.toFixed(1)}s`,
-        );
-        text = appendOutput(text, d.tailOutput);
-        return new Text(text, 0, 0);
-      }
-
-      // Helper: format parsed primary metric suffix (empty string if not available)
-      const parsedSuffix =
-        d.parsedPrimary !== null
-          ? theme.fg(
-              "accent",
-              `, ${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
-            )
-          : "";
-
-      if (d.checksTimedOut) {
-        let text =
-          theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
-          parsedSuffix +
-          theme.fg(
-            "error",
-            ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`,
-          );
-        text = appendOutput(text, d.checksOutput);
-        return new Text(text, 0, 0);
-      }
-
-      if (d.checksPass === false) {
-        let text =
-          theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
-          parsedSuffix +
-          theme.fg(
-            "error",
-            ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`,
-          );
-        text = appendOutput(text, d.checksOutput);
-        return new Text(text, 0, 0);
-      }
-
-      if (d.crashed) {
-        let text =
-          theme.fg(
-            "error",
-            `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`,
-          ) + parsedSuffix;
-        text = appendOutput(text, d.tailOutput);
-        return new Text(text, 0, 0);
-      }
-
-      let text = theme.fg("success", "✅ ");
-
-      // Show wall-clock and parsed primary metric together
-      const parts: string[] = [`wall: ${d.durationSeconds.toFixed(1)}s`];
-      if (d.parsedPrimary !== null) {
-        parts.push(
-          `${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`,
-        );
-      }
-      text += theme.fg("accent", parts.join(", "));
-
-      if (d.checksPass === true) {
-        text += theme.fg(
-          "success",
-          ` ✓ checks ${d.checksDuration.toFixed(1)}s`,
-        );
-      }
-
-      if (d.truncation?.truncated && d.fullOutputPath) {
-        text += theme.fg("warning", " (truncated)");
-      }
-
-      text = appendOutput(text, d.tailOutput);
-
-      if (expanded && d.truncation?.truncated && d.fullOutputPath) {
-        if (d.truncation.truncatedBy === "lines") {
-          text +=
-            "\n" +
-            theme.fg(
-              "warning",
-              `[Truncated: showing ${d.truncation.outputLines} of ${d.truncation.totalLines} lines. Full output: ${d.fullOutputPath}]`,
-            );
-        } else {
-          text +=
-            "\n" +
-            theme.fg(
-              "warning",
-              `[Truncated: ${d.truncation.outputLines} lines shown (${formatSize(EXPERIMENT_MAX_BYTES)} limit). Full output: ${d.fullOutputPath}]`,
-            );
-        }
-      }
-
-      return new Text(text, 0, 0);
-    },
-  });
-
-  // -----------------------------------------------------------------------
-  // log_experiment tool
-  // -----------------------------------------------------------------------
-
-  pi.registerTool({
-    name: "log_experiment",
-    label: "Log Experiment",
-    description:
-      "Record an experiment result. Tracks metrics, updates the status widget and dashboard. Call after every run_experiment.",
-    promptSnippet:
-      "Log experiment result (commit, metric, status, description)",
-    promptGuidelines: [
-      "Always call log_experiment after run_experiment to record the result.",
-      "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
-      "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
-      "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
-      "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
-      'Always include the asi parameter. At minimum: {"hypothesis": "what you tried"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.',
-    ],
-    parameters: LogParams,
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
-        return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
-          details: {},
-        };
-      }
-      const workDir = resolveWorkDir(ctx.cwd);
-      const secondaryMetrics = params.metrics ?? {};
-
-      // Gate: prevent "keep" when last run's checks failed
-      if (
-        params.status === "keep" &&
-        runtime.lastRunChecks &&
-        !runtime.lastRunChecks.pass
-      ) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
-            },
-          ],
-          details: {},
-        };
-      }
-
-      // Validate secondary metrics consistency (after first experiment establishes them)
-      if (state.secondaryMetrics.length > 0) {
-        const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
-        const providedNames = new Set(Object.keys(secondaryMetrics));
-
-        // Check for missing metrics
-        const missing = [...knownNames].filter((n) => !providedNames.has(n));
-        if (missing.length > 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
-              },
-            ],
-            details: {},
-          };
-        }
-
-        // Check for new metrics not yet tracked
-        const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
-        if (newMetrics.length > 0 && !params.force) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
-              },
-            ],
-            details: {},
-          };
-        }
-      }
-
-      // ASI: agent-supplied free-form diagnostics
-      const mergedASI =
-        params.asi && Object.keys(params.asi).length > 0
-          ? (params.asi as ASI)
-          : undefined;
-
-      const iterationTokens = lastIterationTokens(runtime);
-
-      const experiment: ExperimentResult = {
-        commit: params.commit.slice(0, 7),
-        metric: params.metric,
-        metrics: secondaryMetrics,
-        status: params.status,
-        description: params.description,
-        timestamp: Date.now(),
-        segment: state.currentSegment,
-        confidence: null,
-        iterationTokens,
-        asi: mergedASI,
-      };
-
-      state.results.push(experiment);
-      runtime.experimentsThisSession++;
-
-      // Register any new secondary metric names
-      for (const name of Object.keys(secondaryMetrics)) {
-        if (!state.secondaryMetrics.find((m) => m.name === name)) {
-          let unit = "";
-          if (name.endsWith("µs")) unit = "µs";
-          else if (name.endsWith("_ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-          else if (name.endsWith("_kb")) unit = "kb";
-          else if (name.endsWith("_mb")) unit = "mb";
-          state.secondaryMetrics.push({ name, unit });
-        }
-      }
-
-      // Baseline = first run in current segment
-      state.bestMetric = findBaselineMetric(
-        state.results,
-        state.currentSegment,
-      );
-
-      // Compute confidence score (best improvement as multiple of noise floor)
-      state.confidence = computeConfidence(
-        state.results,
-        state.currentSegment,
-        state.bestDirection,
-      );
-      experiment.confidence = state.confidence;
-
-      // Build response text
-      const segmentCount = currentResults(
-        state.results,
-        state.currentSegment,
-      ).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
-
-      if (state.bestMetric !== null) {
-        text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-        if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
-          const delta = params.metric - state.bestMetric;
-          const pct = ((delta / state.bestMetric) * 100).toFixed(1);
-          const sign = delta > 0 ? "+" : "";
-          text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
-        }
-      }
-
-      // Show secondary metrics
-      if (Object.keys(secondaryMetrics).length > 0) {
-        const baselines = findBaselineSecondary(
-          state.results,
-          state.currentSegment,
-          state.secondaryMetrics,
-        );
-        const parts: string[] = [];
-        for (const [name, value] of Object.entries(secondaryMetrics)) {
-          const def = state.secondaryMetrics.find((m) => m.name === name);
-          const unit = def?.unit ?? "";
-          let part = `${name}: ${formatNum(value, unit)}`;
-          const bv = baselines[name];
-          if (bv !== undefined && state.results.length > 1 && bv !== 0) {
-            const d = value - bv;
-            const p = ((d / bv) * 100).toFixed(1);
-            const s = d > 0 ? "+" : "";
-            part += ` (${s}${p}%)`;
-          }
-          parts.push(part);
-        }
-        text += `\nSecondary: ${parts.join("  ")}`;
-      }
-
-      // Show ASI summary
-      if (mergedASI) {
-        const asiParts: string[] = [];
-        for (const [k, v] of Object.entries(mergedASI)) {
-          const s = typeof v === "string" ? v : JSON.stringify(v);
-          asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
-        }
-        if (asiParts.length > 0) {
-          text += `\n📋 ASI: ${asiParts.join(" | ")}`;
-        }
-      }
-
-      // Show confidence score
-      if (state.confidence !== null) {
-        const confStr = state.confidence.toFixed(1);
-        if (state.confidence >= 2.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
-        } else if (state.confidence >= 1.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
-        } else {
-          text += `\n! Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
-        }
-      }
-
-      text += `\n(${segmentCount} experiments`;
-      if (state.maxExperiments !== null) {
-        text += ` / ${state.maxExperiments} max`;
-      }
-      text += `)`;
-
-      // Auto-commit only on keep — discards/crashes get reverted anyway
-      if (params.status === "keep") {
-        try {
-          const resultData: Record<string, unknown> = {
-            status: params.status,
-            [state.metricName || "metric"]: params.metric,
-            ...secondaryMetrics,
-          };
-          const trailerJson = JSON.stringify(resultData);
-          const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
-
-          const execOpts = { cwd: workDir, timeout: 10000 };
-          const addResult = await pi.exec("git", ["add", "-A"], execOpts);
-          if (addResult.code !== 0) {
-            const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(
-              `git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`,
-            );
-          }
-
-          const diffResult = await pi.exec(
-            "git",
-            ["diff", "--cached", "--quiet"],
-            execOpts,
-          );
-          if (diffResult.code === 0) {
-            text += `\n📝 Git: nothing to commit (working tree clean)`;
-          } else {
-            const gitResult = await pi.exec(
-              "git",
-              ["commit", "-m", commitMsg],
-              execOpts,
-            );
-            const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
-            if (gitResult.code === 0) {
-              const firstLine = gitOutput.split("\n")[0] || "";
-              text += `\n📝 Git: committed — ${firstLine}`;
-
-              try {
-                const shaResult = await pi.exec(
-                  "git",
-                  ["rev-parse", "--short=7", "HEAD"],
-                  { cwd: workDir, timeout: 5000 },
-                );
-                const newSha = (shaResult.stdout || "").trim();
-                if (newSha && newSha.length >= 7) {
-                  experiment.commit = newSha;
-                }
-              } catch {
-                // Keep the original commit hash if rev-parse fails
-              }
-            } else {
-              text += `\n! Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
-            }
-          }
-        } catch (e) {
-          text += `\n! Git commit error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
-
-      // Persist to autoresearch.jsonl (always, regardless of status)
-      try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const jsonlEntry: Record<string, unknown> = {
-          run: state.results.length,
-          ...experiment,
-        };
-        // Only write asi if present (keep lines compact when no ASI)
-        if (!mergedASI) delete jsonlEntry.asi;
-        fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
-      } catch (e) {
-        text += `\n! Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
-      }
-
-      // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
-      if (params.status !== "keep") {
-        try {
-          const protectedFiles = [
-            "autoresearch.jsonl",
-            "autoresearch.md",
-            "autoresearch.ideas.md",
-            "autoresearch.sh",
-            "autoresearch.checks.sh",
-          ];
-          const stageCmd = protectedFiles
-            .map(
-              (f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`,
-            )
-            .join("; ");
-          await pi.exec(
-            "bash",
-            ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`],
-            { cwd: workDir, timeout: 10000 },
-          );
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
-        } catch (e) {
-          text += `\n! Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
-
-      // Clear running experiment and checks state (log_experiment consumes the run)
-      const wallClockSeconds = runtime.lastRunDuration;
-      runtime.runningExperiment = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
-
-      // Check if max experiments limit reached
-      const limitReached =
-        state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-      if (limitReached) {
-        text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        runtime.autoresearchMode = false;
-        ctx.abort();
-      }
-
-      updateWidget(ctx);
-
-      // Refresh fullscreen overlay if open
-      if (overlayTui) overlayTui.requestRender();
-
-      return {
-        content: [{ type: "text", text }],
-        details: {
-          experiment: { ...experiment, metrics: { ...experiment.metrics } },
-          state: cloneExperimentState(state),
-          wallClockSeconds,
-        } as LogDetails,
-      };
-    },
-
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("log_experiment "));
-      const color =
-        args.status === "keep"
-          ? "success"
-          : args.status === "crash" || args.status === "checks_failed"
-            ? "error"
-            : "warning";
-      text += theme.fg(color, args.status);
-      text += " " + theme.fg("dim", args.description);
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const d = result.details as LogDetails | undefined;
-      if (!d) {
-        const t = result.content[0];
-        return new Text(t?.type === "text" ? t.text : "", 0, 0);
-      }
-
-      const { experiment: exp, state: s } = d;
-      const color =
-        exp.status === "keep"
-          ? "success"
-          : exp.status === "crash" || exp.status === "checks_failed"
-            ? "error"
-            : "warning";
-      const icon =
-        exp.status === "keep"
-          ? "✓"
-          : exp.status === "crash"
-            ? "✗"
-            : exp.status === "checks_failed"
-              ? "!"
-              : "–";
-
-      let text =
-        theme.fg(color, `${icon} `) +
-        theme.fg("accent", `#${s.results.length}`);
-
-      // Show wall-clock and primary metric together
-      const metricParts: string[] = [];
-      if (d.wallClockSeconds !== null && d.wallClockSeconds !== undefined) {
-        metricParts.push(`wall: ${d.wallClockSeconds.toFixed(1)}s`);
-      }
-      if (exp.metric > 0) {
-        metricParts.push(
-          `${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`,
-        );
-      }
-      if (metricParts.length > 0) {
-        text +=
-          theme.fg("dim", " (") +
-          theme.fg("warning", metricParts.join(theme.fg("dim", ", "))) +
-          theme.fg("dim", ")");
-      }
-
-      text += " " + theme.fg("muted", exp.description);
-
-      // Show best metric for context (overall best, not just this run)
-      if (s.bestMetric !== null) {
-        // Find the actual best kept metric in the current segment
-        let best = s.bestMetric;
-        for (const r of s.results) {
-          if (
-            r.segment === s.currentSegment &&
-            r.status === "keep" &&
-            r.metric > 0
-          ) {
-            if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
-          }
-        }
-        text +=
-          theme.fg("dim", " │ ") +
-          theme.fg("warning", `★ best: ${formatNum(best, s.metricUnit)}`);
-      }
-
-      // Show secondary metrics inline
-      if (Object.keys(exp.metrics).length > 0) {
-        const parts: string[] = [];
-        for (const [name, value] of Object.entries(exp.metrics)) {
-          const def = s.secondaryMetrics.find((m) => m.name === name);
-          parts.push(`${name}=${formatNum(value, def?.unit ?? "")}`);
-        }
-        text += theme.fg("dim", `  ${parts.join(" ")}`);
-      }
-
-      return new Text(text, 0, 0);
-    },
   });
 
   // -----------------------------------------------------------------------
