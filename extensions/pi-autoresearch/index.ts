@@ -153,71 +153,60 @@ interface AutoresearchRuntime {
 
 const RunParams = Type.Object({
   command: Type.String({
-    description:
-      "Shell command to run (e.g. 'pnpm test:vitest', 'uv run train.py')",
+    description: "Shell command to run",
   }),
   timeout_seconds: Type.Optional(
     Type.Number({
-      description: "Kill after this many seconds (default: 600)",
+      description: "Kill after N seconds (default: 600)",
     }),
   ),
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
-        "Kill autoresearch.checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+        "Kill checks after N seconds (default: 300). Only if checks file exists.",
     }),
   ),
 });
 
 const InitParams = Type.Object({
   name: Type.String({
-    description:
-      'Human-readable name for this experiment session (e.g. "Optimizing liquid for fastest execution and parsing")',
+    description: "Human-readable experiment name",
   }),
   metric_name: Type.String({
-    description:
-      'Display name for the primary metric (e.g. "total_µs", "bundle_kb", "val_bpb"). Shown in dashboard headers.',
+    description: "Primary metric name (e.g. total_µs, bundle_kb, val_bpb)",
   }),
   metric_unit: Type.Optional(
     Type.String({
-      description:
-        'Unit for the primary metric. Use "µs", "ms", "s", "kb", "mb", or "" for unitless. Affects number formatting. Default: ""',
+      description: 'Unit: µs, ms, s, kb, mb, or "" for unitless',
     }),
   ),
   direction: Type.Optional(
     Type.String({
-      description:
-        'Whether "lower" or "higher" is better for the primary metric. Default: "lower".',
+      description: 'Better direction: "lower" or "higher" (default: lower)',
     }),
   ),
 });
 
 const LogParams = Type.Object({
-  commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
+  commit: Type.String({ description: "Git commit hash (7 chars)" }),
   metric: Type.Number({
-    description:
-      "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
+    description: "Primary metric value (0 for crashes)",
   }),
   status: StringEnum(["keep", "discard", "crash", "checks_failed"] as const),
-  description: Type.String({
-    description: "Short description of what this experiment tried",
-  }),
+  description: Type.String({ description: "What this experiment tried" }),
   metrics: Type.Optional(
     Type.Record(Type.String(), Type.Number(), {
-      description:
-        'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
+      description: "Additional { name: value } metrics for tradeoff monitoring",
     }),
   ),
   force: Type.Optional(
     Type.Boolean({
-      description:
-        "Set to true to allow adding a new secondary metric that wasn't tracked before. Only use for metrics that have proven very valuable to watch.",
+      description: "Allow adding new secondary metrics",
     }),
   ),
   asi: Type.Optional(
     Type.Record(Type.String(), Type.Unknown(), {
-      description:
-        "Actionable Side Information — structured diagnostics for this run. Free-form key/value pairs. Parsed ASI from run_experiment output is merged automatically; use this to add or override fields.",
+      description: "Structured diagnostics: { key: value } pairs",
     }),
   ),
 });
@@ -1363,14 +1352,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       pi.registerTool({
         name: "init_experiment",
         label: "Init Experiment",
-        description:
-          "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to autoresearch.jsonl.",
-        promptSnippet:
-          "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
+        description: "Initialize experiment session: name, metric, unit, direction. Writes config header to autoresearch.jsonl.",
+        promptSnippet: "Initialize experiment session",
         promptGuidelines: [
-          "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
-          "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
-          "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
+          "Call once before the first run_experiment.",
+          "Do NOT call if autoresearch.jsonl already exists.",
+          "Call again to reset baseline for new optimization target.",
         ],
         parameters: InitParams,
 
@@ -1484,13 +1471,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       pi.registerTool({
         name: "run_experiment",
         label: "Run Experiment",
-        description: `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
-        promptSnippet:
-          "Run a timed experiment command (captures duration, output, exit code)",
+        description: `Run command, time it, capture output, detect pass/fail. Output truncated to last ${EXPERIMENT_MAX_LINES} lines/${EXPERIMENT_MAX_BYTES / 1024}KB.`,
+        promptSnippet: "Run timed experiment command",
         promptGuidelines: [
-          "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
-          "After run_experiment, always call log_experiment to record the result.",
-          "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
+          "Use instead of bash — handles timing and output capture.",
+          "Always call log_experiment after.",
+          "METRIC name=value lines in output are parsed automatically.",
         ],
         parameters: RunParams,
 
@@ -2101,17 +2087,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       pi.registerTool({
         name: "log_experiment",
         label: "Log Experiment",
-        description:
-          "Record an experiment result. Tracks metrics, updates the status widget and dashboard. Call after every run_experiment.",
-        promptSnippet:
-          "Log experiment result (commit, metric, status, description)",
+        description: "Record result. Commits on 'keep', reverts on 'discard'/'crash'/'checks_failed'.",
+        promptSnippet: "Log experiment result",
         promptGuidelines: [
-          "Always call log_experiment after run_experiment to record the result.",
-          "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
-          "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
-          "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
-          "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
-          'Always include the asi parameter. At minimum: {"hypothesis": "what you tried"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.',
+          "Always call after run_experiment.",
+          "'keep' = improved, 'discard' = worse/unchanged, 'crash' = failed.",
+          "Secondary metrics are for monitoring only.",
+          "Include asi with hypothesis and learnings.",
         ],
         parameters: LogParams,
 
