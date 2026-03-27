@@ -1,6 +1,6 @@
 ---
 name: autoresearch-create
-description: Set up and run an autonomous experiment loop for any optimization target. Gathers what to optimize, then starts the loop immediately. Use when asked to "run autoresearch", "optimize X in a loop", "set up autoresearch for X", or "start experiments".
+description: Autonomous metric optimization loop.
 ---
 
 # Autoresearch
