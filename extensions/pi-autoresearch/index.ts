@@ -2521,9 +2521,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_switch", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_fork", async (_e, ctx) => reconstructState(ctx));
+  pi.on("session_start", async (event, ctx) => {
+    // event.reason: "startup" | "reload" | "new" | "resume" | "fork"
+    // event.previousSessionFile: set for "new", "resume", "fork"
+    reconstructState(ctx);
+  });
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_before_switch", async () => {
     clearOverlay();
